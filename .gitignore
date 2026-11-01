@@ -1,0 +1,16 @@
+.gradle/
+build/
+models/
+.idea/
+*.log
+native/macos/ReaptiveVoiceDictationHelper
+native/macos/ReaptiveVoiceLauncher
+native/macos/ReaptiveVoiceMicrophone
+native/macos/Rvoice.app/Contents/MacOS/ReaptiveVoiceDictationHelper
+.reaptive-voice/
+native/macos/RvoiceSpeaker
+.kotlin/
+**/build/
+.DS_Store
+local.properties
+native/macos/Rvoice.app/
