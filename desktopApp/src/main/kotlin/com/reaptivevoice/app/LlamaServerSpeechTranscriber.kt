@@ -24,6 +24,7 @@ class LlamaServerSpeechTranscriber(
         .connectTimeout(Duration.ofSeconds(3))
         .build()
 
+    //shared
     private var serverProcess: Process? = null
 
     fun startAndWaitUntilReady(): String? {
