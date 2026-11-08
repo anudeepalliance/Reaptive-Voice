@@ -18,10 +18,15 @@ import androidx.compose.ui.window.rememberWindowState
 import org.json.JSONObject
 import java.io.File
 
-fun main() {
+/**
+ * Starts Rvoice as a menu bar app: it has no Dock icon, and the window opens from the menu bar icon. A start at login (see MacLoginItem) keeps the window closed; any other start opens it.
+ */
+fun main(launchArguments: Array<String>) {
+    System.setProperty("apple.awt.UIElement", "true")
     System.setProperty("apple.awt.application.name", "Rvoice")
     System.setProperty("apple.awt.enableTemplateImages", "true")
     applySavedMacAppearance()
+    val wasStartedAtLogin = startedAtLoginLaunchArgument in launchArguments
     val coordinator = DictationCoordinator()
     coordinator.start()
     Runtime.getRuntime().addShutdownHook(
@@ -31,7 +36,7 @@ fun main() {
     )
     application {
         val isSystemInDarkTheme = isSystemInDarkTheme()
-        var isSettingsWindowOpen by remember { mutableStateOf(true) }
+        var isSettingsWindowOpen by remember { mutableStateOf(!wasStartedAtLogin) }
         var bringWindowToFrontRequestCount by remember { mutableStateOf(0) }
         val showRvoiceWindowInFront = {
             isSettingsWindowOpen = true
@@ -87,16 +92,6 @@ fun main() {
                 LaunchedEffect(bringWindowToFrontRequestCount) {
                     bringWindowToFrontAndActivateRvoice(window)
                 }
-                LaunchedEffect(Unit) {
-                    val testDestination = System.getenv("RVOICE_TEST_SAVE_MP3_TO")
-                    if (testDestination != null) {
-                        while (!coordinator.screenState.isSpeakingVoiceReady) {
-                            kotlinx.coroutines.delay(500)
-                        }
-                        coordinator.saveTextAsMp3("This MP3 was saved to a folder chosen in the save window.", File(testDestination))
-                        System.err.println("RVOICE-DEBUG save requested to $testDestination")
-                    }
-                }
                 val screenState = coordinator.screenState
                 DictationScreen(
                     screenState = screenState,
@@ -118,6 +113,9 @@ fun main() {
                     },
                     onOpenAtLoginChange = { isEnabled ->
                         coordinator.setOpenAtLogin(isEnabled)
+                    },
+                    onTranscriptCleanupChange = { isEnabled ->
+                        coordinator.setTranscriptCleanupEnabled(isEnabled)
                     },
                     onAppearanceSelected = { appearanceMode ->
                         coordinator.selectAppearance(appearanceMode)
@@ -156,7 +154,6 @@ fun main() {
                         coordinator.rewindSpeech()
                     },
                     onSaveTextAsMp3 = { text ->
-                        System.err.println("RVOICE-DEBUG save clicked, text length ${text.length}")
                         val destination = askWhereToSaveWithMacSaveWindow(window, "Save MP3", coordinator.suggestedDownloadFileNameForText(text))
                         if (destination != null) {
                             coordinator.saveTextAsMp3(text, destination)
@@ -195,6 +192,12 @@ fun main() {
                     onCloseSavedAudioPlayer = {
                         coordinator.closeSavedAudioPlayer()
                     },
+                    onCopyErrorLogEntry = { errorLogEntry ->
+                        coordinator.copyErrorLogEntry(errorLogEntry)
+                    },
+                    onClearErrorLog = {
+                        coordinator.clearErrorLog()
+                    },
                 )
             }
         }
@@ -217,7 +220,7 @@ private fun bringWindowToFrontAndActivateRvoice(window: java.awt.Window) {
 }
 
 /**
- * Clicking Rvoice's Dock icon while it is running opens the window, as Mac apps do. Does nothing where the system does not report Dock clicks.
+ * Opening Rvoice again while it is running (from Spotlight, Finder or a Dock shortcut) opens its window, as Mac apps do. Does nothing where the system does not report this.
  */
 private fun reopenWindowWhenDockIconIsClicked(showWindow: () -> Unit) {
     if (!java.awt.Desktop.isDesktopSupported()) {
@@ -236,12 +239,11 @@ private fun reopenWindowWhenDockIconIsClicked(showWindow: () -> Unit) {
  * Shows the standard macOS save window over Rvoice's window, starting in Downloads with the suggested file name. Returns the chosen file, or null when the person cancels. Attaching it to the Rvoice window keeps it from opening behind other windows.
  */
 private fun askWhereToSaveWithMacSaveWindow(ownerWindow: java.awt.Frame, saveWindowTitle: String, suggestedFileName: String): File? {
+    bringWindowToFrontAndActivateRvoice(ownerWindow)
     val saveWindow = java.awt.FileDialog(ownerWindow, saveWindowTitle, java.awt.FileDialog.SAVE)
     saveWindow.directory = File(System.getProperty("user.home"), "Downloads").absolutePath
     saveWindow.file = suggestedFileName
-    System.err.println("RVOICE-DEBUG showing save window, owner visible=${ownerWindow.isVisible}")
     saveWindow.isVisible = true
-    System.err.println("RVOICE-DEBUG save window closed: ${saveWindow.directory} ${saveWindow.file}")
     val chosenDirectory = saveWindow.directory ?: return null
     val chosenFileName = saveWindow.file ?: return null
     val fileNameWithExtension = if (chosenFileName.endsWith(".mp3", ignoreCase = true)) chosenFileName else "$chosenFileName.mp3"

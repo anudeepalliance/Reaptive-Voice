@@ -2,17 +2,17 @@ package com.reaptivevoice.app
 
 import java.io.File
 
+/** Passed to Rvoice by the login item, so a start at login stays in the menu bar without opening the window. */
+const val startedAtLoginLaunchArgument = "--started-at-login"
+
 /**
- * Turns on "open when you log in" by installing a per-user login item. If Rvoice is already open, the login item does nothing, so checking the box does not start a second copy.
+ * Turns on "open when you log in" by installing a per-user login item. It starts Rvoice in the background with only its menu bar icon, no window. If Rvoice is already open, the login item does nothing, so checking the box does not start a second copy.
  */
 class MacLoginItem(
     private val projectRoot: File,
+    private val agentFile: File = File(System.getProperty("user.home"), "Library/LaunchAgents/com.reaptivevoice.app.plist"),
+    private val installedApp: File = File("/Applications/Rvoice.app"),
 ) {
-    private val agentFile = File(
-        System.getProperty("user.home"),
-        "Library/LaunchAgents/com.reaptivevoice.app.plist",
-    )
-
     fun isEnabled(): Boolean {
         return agentFile.isFile
     }
@@ -34,17 +34,34 @@ class MacLoginItem(
         return null
     }
 
+    /**
+     * Rewrites a login item file on disk that was written by an older Rvoice, so it starts the installed app in the background without a window. A file that already does that, or no file (open at login is off), is left as it is. macOS picks up the change at the next login.
+     *
+     * Why: older files either started the Gradle copy, which cannot see the installed app running and opened a second Rvoice at every login, or opened the full window at login.
+     */
+    fun rewriteOutdatedLoginItemFileOnDisk() {
+        if (!agentFile.isFile) {
+            return
+        }
+        if (!agentFile.readText().contains(xmlEscape(commandThatStartsRvoiceAtLogin()))) {
+            agentFile.writeText(loginAgentPlist())
+        }
+    }
+
+    /** Opens the installed app in the background (`-g`, so it does not take focus) when it exists; otherwise runs the Gradle copy unless one is already running. */
+    private fun commandThatStartsRvoiceAtLogin(): String {
+        if (installedApp.isDirectory) {
+            return "open -g -a ${installedApp.absolutePath} --args $startedAtLoginLaunchArgument"
+        }
+        return "if pgrep -f 'com.reaptivevoice.app.MainKt' >/dev/null; then exit 0; fi; cd '${projectRoot.absolutePath}' && exec ./gradlew :desktopApp:run --console=plain --args=$startedAtLoginLaunchArgument"
+    }
+
     private fun loginAgentPlist(): String {
         val home = System.getProperty("user.home")
         val javaHome = System.getProperty("java.home")
         val projectPath = projectRoot.absolutePath
         val logPath = "$home/.reaptive-voice/login-launch.log"
-        val installedApp = File("/Applications/Rvoice.app")
-        val command = if (installedApp.isDirectory) {
-            "open -a /Applications/Rvoice.app"
-        } else {
-            "if pgrep -f 'com.reaptivevoice.app.MainKt' >/dev/null; then exit 0; fi; cd '${xmlEscape(projectPath)}' && exec ./gradlew :desktopApp:run --console=plain"
-        }
+        val command = commandThatStartsRvoiceAtLogin()
         return """
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

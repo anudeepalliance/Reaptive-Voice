@@ -40,6 +40,7 @@ class GlobalDictationHotkeyBridge(
     var onStopSpeakingRequest: () -> Unit = { }
     var onSpeechControl: (action: String) -> Unit = { }
     var onSaveAudioRequest: (text: String) -> Unit = { }
+    var onPillCancel: () -> Unit = { }
     var onSavedAudioPlayerState: (SavedAudioPlayerState) -> Unit = { }
     var onSavedAudioPlayerClosed: () -> Unit = { }
     var onSavedAudioPlayerProblem: (String) -> Unit = { }
@@ -216,6 +217,9 @@ class GlobalDictationHotkeyBridge(
             }
             "player-error" -> {
                 onSavedAudioPlayerProblem(message.optString("message"))
+            }
+            "pill-cancel" -> {
+                onPillCancel()
             }
             "save-audio-request" -> {
                 onSaveAudioRequest(message.optString("text"))

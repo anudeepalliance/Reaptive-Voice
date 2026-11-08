@@ -157,15 +157,29 @@ fun readPcm16MonoWavSamplesFromDisk(wavFile: File): ShortArray {
 }
 
 /**
- * True when the clip holds at least `minimumSpeechMilliseconds` (a third of a second by default) that is clearly louder than a quiet room. Live updates wait for this, because on silence the speech model tends to guess a filler word such as "Okay."
+ * True when a recording has any sound at all that could be speech, even quiet speech. The final pass of a short take uses this instead of [containsSpeech], so a quiet speaker is still transcribed while a silent take is not sent to the model.
+ *
+ * Why: on silence or room noise the speech model invents text: "Thank you.", or the custom word list from its instruction ("Vocabulary: Peekopals, Meera, Ktor."). Measured rooms sit at 25 to 65 and speech peaks at 350 to 570, so the bar is 150 for a fifth of a second.
  */
-fun containsSpeech(samples: ShortArray, sampleRate: Int = speechModelSampleRate, minimumSpeechMilliseconds: Int = 300): Boolean {
+fun containsAnySoundThatCouldBeSpeech(samples: ShortArray, sampleRate: Int = speechModelSampleRate): Boolean {
+    return containsSpeech(samples, sampleRate, minimumSpeechMilliseconds = 200, loudnessThreshold = 150.0)
+}
+
+/**
+ * True when the clip holds at least `minimumSpeechMilliseconds` (a third of a second by default) louder than `loudnessThreshold`, which by default is clearly louder than a quiet room. Live updates wait for this, because on silence the speech model tends to guess a filler word such as "Okay."
+ */
+fun containsSpeech(
+    samples: ShortArray,
+    sampleRate: Int = speechModelSampleRate,
+    minimumSpeechMilliseconds: Int = 300,
+    loudnessThreshold: Double = 350.0,
+): Boolean {
     val windowLength = sampleRate / 50
     val loudWindowsNeeded = (minimumSpeechMilliseconds / 20).coerceAtLeast(1)
     var loudWindowCount = 0
     var windowStart = 0
     while (windowStart + windowLength <= samples.size) {
-        if (rootMeanSquare(samples, windowStart, windowStart + windowLength) > 350.0) {
+        if (rootMeanSquare(samples, windowStart, windowStart + windowLength) > loudnessThreshold) {
             loudWindowCount++
             if (loudWindowCount >= loudWindowsNeeded) {
                 return true

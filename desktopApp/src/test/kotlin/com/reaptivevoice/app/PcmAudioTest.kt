@@ -53,6 +53,27 @@ class PcmAudioTest {
     }
 
     @Test
+    fun treatsRoomNoiseAsNoSoundThatCouldBeSpeech() {
+        val roomNoise = ShortArray(48_000) { index ->
+            (if (index % 2 == 0) 65 else -65).toShort()
+        }
+        assertEquals(false, containsAnySoundThatCouldBeSpeech(roomNoise))
+    }
+
+    @Test
+    fun hearsQuietSpeechThatTheLiveCheckWouldSkip() {
+        val quietSpeech = ShortArray(32_000) { index ->
+            if (index in 8_000 until 16_000) {
+                (if (index % 2 == 0) 250 else -250).toShort()
+            } else {
+                0
+            }
+        }
+        assertEquals(false, containsSpeech(quietSpeech))
+        assertTrue(containsAnySoundThatCouldBeSpeech(quietSpeech))
+    }
+
+    @Test
     fun cutsInsideThePause() {
         val samples = ShortArray(160_000) { index ->
             if (index in 96_000 until 104_000) {

@@ -65,6 +65,7 @@ class DictationCoordinator {
     private val modelDirectory = File(projectRoot, "models/LFM3-Audio-2B")
     private val modelFile = File(modelDirectory, "LFM3-Audio-2B-Q8_0.gguf")
     private val audioProjectorFile = File(modelDirectory, "mmproj-LFM3-Audio-2B-Q8_0.gguf")
+    private val transcriptCleanupModelFile = File(projectRoot, "models/LFM3-1.7B/LFM3-1.7B-Q8_0.gguf")
     private val settingsFile = File(runtimeDirectory, "settings.json")
     private val macLoginItem = MacLoginItem(projectRoot)
 
@@ -80,8 +81,25 @@ class DictationCoordinator {
         logFile = File(runtimeDirectory, "dictation-helper.log"),
     )
     private var transcriber: LlamaServerSpeechTranscriber? = null
+
+    /** The LFM3-1.7B text model that tidies finished dictations; null while text cleanup is off or not started yet. */
+    @Volatile
+    private var transcriptCleanupModel: LlamaServerTranscriptCleanupModel? = null
+
+    @Volatile
+    private var isTranscriptCleanupModelReady = false
+
+    /** Makes loading and unloading the cleanup model happen one at a time, so quickly toggling the setting cannot leave two servers running. */
+    private val transcriptCleanupModelLock = Any()
+
+    /** How many times in a row the cleanup model server had to be restarted; reset once it is ready. */
+    private var transcriptCleanupServerRestartCount = 0
     private var speechSpeaker: LocalSpeechSpeaker? = null
     private val speechAudioLibrary = SpeechAudioLibrary(File(runtimeDirectory, "speech-audio"))
+    private val errorLogBook = ErrorLogBook(File(runtimeDirectory, "error-log.jsonl"))
+
+    /** How many times in a row the dictation model server had to be restarted; reset once it is ready. */
+    private var speechServerRestartCount = 0
 
     /** Turns finished recordings into MP3s one at a time, away from the threads that handle speaking and dictation. */
     private val audioFileThread = Executors.newSingleThreadExecutor { runnable ->
@@ -132,6 +150,12 @@ class DictationCoordinator {
         runtimeDirectory.mkdirs()
         loadSettings()
         refreshSavedAudioList()
+        refreshErrorLog()
+        runCatching {
+            macLoginItem.rewriteOutdatedLoginItemFileOnDisk()
+        }.onFailure { failure ->
+            recordError("Open at login", "Could not update the open at login item.", failure.message.orEmpty())
+        }
         updateScreenState { current ->
             current.copy(modelFootnote = modelFootnote())
         }
@@ -171,18 +195,20 @@ class DictationCoordinator {
             }
         }
         hotkeyBridge.onHotkey = { phase, _ ->
-            sessionThread.execute {
+            if (phase == "cancel") {
+                cancelDictationRightAway()
+            }
+            runOnSessionThread {
                 if (phase != "ignored" && phase != "cancel" && !acceptHotkeyToggle()) {
-                    return@execute
+                    return@runOnSessionThread
                 }
                 if (phase == "cancel") {
-                    cancelDictationAndKeepWhatIsTyped()
-                    return@execute
+                    return@runOnSessionThread
                 }
                 if (phase == "start" && isSpeakingOutLoud) {
                     speechSpeaker?.stopSpeaking()
                     hotkeyBridge.setIdle()
-                    return@execute
+                    return@runOnSessionThread
                 }
                 when (phase) {
                     "start" -> beginListening()
@@ -206,6 +232,7 @@ class DictationCoordinator {
             }
         }
         hotkeyBridge.onSavedAudioPlayerProblem = { problem ->
+            recordError("Saved audio", problem)
             updateScreenState { current ->
                 current.copy(savedAudioPlayer = null, statusLine = problem)
             }
@@ -216,15 +243,20 @@ class DictationCoordinator {
         hotkeyBridge.onStopSpeakingRequest = {
             stopSpeaking()
         }
+        hotkeyBridge.onPillCancel = {
+            cancelWhateverThePillShows()
+        }
         hotkeyBridge.onSaveAudioRequest = { text ->
             saveTextAsMp3(text)
         }
         hotkeyBridge.onSpeechControl = { action ->
-            when (action) {
-                "next-speed" -> switchToNextSpeakingSpeed()
-                "rewind" -> rewindSpeech()
-                "toggle-pause" -> toggleSpeechPause()
-                "stop" -> stopSpeaking()
+            val chosenSpeed = action.removePrefix("speed:").toFloatOrNull()
+            when {
+                action.startsWith("speed:") && chosenSpeed in speakingSpeeds -> selectSpeakingSpeed(chosenSpeed!!)
+                action == "next-speed" -> switchToNextSpeakingSpeed()
+                action == "rewind" -> rewindSpeech()
+                action == "toggle-pause" -> toggleSpeechPause()
+                action == "stop" -> stopSpeaking()
             }
         }
         hotkeyBridge.start()
@@ -245,6 +277,31 @@ class DictationCoordinator {
         ).apply {
             isDaemon = true
             start()
+        }
+        if (screenState.isTranscriptCleanupEnabled) {
+            loadTranscriptCleanupModelInTheBackground()
+        } else {
+            updateScreenState { current ->
+                current.copy(transcriptCleanupStatus = "Off.")
+            }
+        }
+    }
+
+    /**
+     * Turns text cleanup on or off. On loads the LFM3-1.7B text model in the background; off unloads it to free memory.
+     */
+    fun setTranscriptCleanupEnabled(isEnabled: Boolean) {
+        updateScreenState { current ->
+            current.copy(isTranscriptCleanupEnabled = isEnabled)
+        }
+        saveSettings()
+        if (isEnabled) {
+            loadTranscriptCleanupModelInTheBackground()
+        } else {
+            unloadTranscriptCleanupModelInTheBackground()
+            updateScreenState { current ->
+                current.copy(transcriptCleanupStatus = "Off.")
+            }
         }
     }
 
@@ -427,19 +484,78 @@ class DictationCoordinator {
      */
     /** Escape pressed inside Rvoice's own window during a take: same as Escape anywhere else. */
     fun cancelDictationFromEscapeKey() {
-        if (sessionPhase == DictationSessionPhase.Idle) {
-            return
-        }
-        wasTakeCancelled = true
-        sessionThread.execute {
-            cancelDictationAndKeepWhatIsTyped()
+        cancelDictationRightAway()
+    }
+
+    /**
+     * Escape or the pill's ✕ during a take. Runs straight away rather than waiting its turn, because the dictation step it cancels may be the thing that is stuck. While listening, the microphone stops and the recording is thrown away; while the final text is being written, the request to the model is abandoned. Whatever was already typed stays.
+     */
+    private fun cancelDictationRightAway() {
+        when (sessionPhase) {
+            DictationSessionPhase.Idle -> return
+            DictationSessionPhase.Listening -> {
+                wasTakeCancelled = true
+                transcriber?.cancelTranscriptionInProgress()
+                runOnSessionThread {
+                    cancelDictationAndKeepWhatIsTyped()
+                }
+            }
+            DictationSessionPhase.Transcribing -> {
+                wasTakeCancelled = true
+                transcriber?.cancelTranscriptionInProgress()
+                updateScreenState { current ->
+                    current.copy(isListening = false, isTranscribing = false, microphoneLevel = 0f)
+                }
+                endWithMessage(title = "Cancelled", detail = "", tone = "error", statusLine = "Dictation cancelled. What was already typed stays.")
+            }
         }
     }
 
-    fun onCommandDInsideThisWindow() {
+    /** The ✕ on the pill: cancels the dictation or the MP3 being made, otherwise just hides the pill. */
+    private fun cancelWhateverThePillShows() {
+        when {
+            sessionPhase != DictationSessionPhase.Idle -> cancelDictationRightAway()
+            screenState.speechFileProgress != null -> cancelSavingMp3()
+            else -> hotkeyBridge.hidePill()
+        }
+    }
+
+    /**
+     * Runs dictation work one step at a time on the dictation thread. If a step fails unexpectedly, Rvoice goes back to Ready and says so, instead of staying stuck on "Still writing". Details go to ~/.reaptive-voice/app-errors.log.
+     */
+    private fun runOnSessionThread(dictationStep: () -> Unit) {
         sessionThread.execute {
+            try {
+                dictationStep()
+            } catch (throwable: Throwable) {
+                recoverFromUnexpectedProblem(throwable)
+            }
+        }
+    }
+
+    private fun recoverFromUnexpectedProblem(throwable: Throwable) {
+        recordError("Dictation", "Something went wrong: ${throwable.message ?: throwable.javaClass.simpleName}", throwable.stackTraceToString())
+        stopClock()
+        if (sessionPhase == DictationSessionPhase.Listening) {
+            runCatching {
+                microphone.stopAndWriteWav(File(runtimeDirectory, "captures/discarded.wav"))
+            }
+        }
+        updateScreenState { current ->
+            current.copy(isListening = false, isTranscribing = false, microphoneLevel = 0f)
+        }
+        endWithMessage(
+            title = "Something went wrong",
+            detail = throwable.message ?: throwable.javaClass.simpleName,
+            tone = "error",
+            statusLine = "Something went wrong, so Rvoice stopped this dictation. Details are on General → Error log.",
+        )
+    }
+
+    fun onCommandDInsideThisWindow() {
+        runOnSessionThread {
             if (!acceptHotkeyToggle()) {
-                return@execute
+                return@runOnSessionThread
             }
             when (sessionPhase) {
                 DictationSessionPhase.Idle -> beginListening(insertIntoThisApp = true)
@@ -546,6 +662,38 @@ class DictationCoordinator {
     }
 
     /** Re-reads the MP3 folder, deleting files older than seven days, and shows the result on the Saved audio page. */
+    /**
+     * Writes a problem to the error log on disk and shows it on the Error log tab. Safe to call from any thread.
+     */
+    private fun recordError(area: String, message: String, details: String = "") {
+        runCatching {
+            errorLogBook.appendErrorToLogFileOnDisk(area, message, details)
+        }
+        refreshErrorLog()
+    }
+
+    /** Re-reads the error log from disk (dropping entries older than seven days) and shows it on the Error log tab. */
+    fun refreshErrorLog() {
+        val errorLogEntries = runCatching {
+            errorLogBook.readErrorsFromDiskAfterDeletingOldOnes()
+        }.getOrDefault(emptyList())
+        updateScreenState { current ->
+            current.copy(errorLogEntries = errorLogEntries)
+        }
+    }
+
+    fun clearErrorLog() {
+        runCatching {
+            errorLogBook.deleteAllErrorsFromDisk()
+        }
+        refreshErrorLog()
+    }
+
+    /** Copies one error, with its details, so it can be pasted into a message or bug report. */
+    fun copyErrorLogEntry(errorLogEntry: ErrorLogEntry) {
+        copyTextToClipboard("${errorLogEntry.occurredAtLabel} · ${errorLogEntry.area}\n${errorLogEntry.message}\n\n${errorLogEntry.details}".trim())
+    }
+
     fun refreshSavedAudioList() {
         audioFileThread.execute {
             val savedAudioFiles = speechAudioLibrary.listSavedAudioFromDiskAfterDeletingOldOnes()
@@ -653,6 +801,9 @@ class DictationCoordinator {
                         mp3File.copyTo(downloadDestination, overwrite = true)
                         ProcessBuilder("open", "-R", downloadDestination.absolutePath).start()
                     }.exceptionOrNull()?.message
+                }
+                if (problem != null) {
+                    recordError("Saved audio", "Could not save ${downloadDestination.name}: $problem")
                 }
                 updateScreenState { current ->
                     current.copy(statusLine = problem ?: "Saved ${downloadDestination.name}.")
@@ -769,6 +920,7 @@ class DictationCoordinator {
             }
         }
         speaker.onProblem = { problem ->
+            recordError("Reading aloud", problem, logTailOf(File(runtimeDirectory, "speaker.log")))
             hotkeyBridge.showPill(title = "Could not speak", detail = problem, tone = "error", microphoneLevel = 0f)
             schedulePillHide()
         }
@@ -802,6 +954,7 @@ class DictationCoordinator {
             convertRecordingToMp3(wavFile, lengthInSeconds, wasSpokenOutLoud = false)
         }
         speaker.onSaveFailed = { problem ->
+            recordError("Reading aloud", "Could not make the MP3: $problem", logTailOf(File(runtimeDirectory, "speaker.log")))
             updateScreenState { current ->
                 current.copy(speechFileProgress = null, statusLine = problem)
             }
@@ -840,6 +993,7 @@ class DictationCoordinator {
      * Tries starting the speaking program again after two seconds, up to three times in a row. After that the Speech page shows the reason and a Try again button.
      */
     private fun restartSpeakingVoiceOrReportProblem(problem: String) {
+        recordError("Reading aloud", problem, logTailOf(File(runtimeDirectory, "speaker.log")))
         speakingVoiceRestartCount++
         if (speakingVoiceRestartCount > 3) {
             updateScreenState { current ->
@@ -867,6 +1021,7 @@ class DictationCoordinator {
         speechSpeaker?.shutdown()
         audioFileThread.shutdown()
         transcriber?.shutdown()
+        transcriptCleanupModel?.shutdown()
         sessionThread.shutdownNow()
         clock.shutdownNow()
     }
@@ -891,6 +1046,7 @@ class DictationCoordinator {
         }
         val microphoneProblem = microphone.start(screenState.selectedMicrophoneId)
         if (microphoneProblem != null) {
+            recordError("Microphone", microphoneProblem, logTailOf(File(runtimeDirectory, "microphone.log")))
             hotkeyBridge.setIdle()
             hotkeyBridge.showPill(
                 title = "No microphone",
@@ -1016,6 +1172,14 @@ class DictationCoordinator {
         val transcript = try {
             transcribeTakeUsingLockedInParts(readPcm16MonoWavSamplesFromDisk(captureFile), isFinalPass = true)
         } catch (exception: Exception) {
+            if (wasTakeCancelled || exception is TranscriptionCancelledException) {
+                return
+            }
+            recordError(
+                "Dictation",
+                "Transcription failed: ${exception.message ?: exception.javaClass.simpleName}",
+                exception.stackTraceToString() + "\n\nModel server log:\n" + logTailOf(File(runtimeDirectory, "llama-server.log")),
+            )
             endWithMessage(
                 title = "Transcription failed",
                 detail = exception.message ?: "The speech model returned an error.",
@@ -1035,22 +1199,25 @@ class DictationCoordinator {
             return
         }
         if (wasTakeCancelled) {
-            endWithMessage(title = "Cancelled", detail = "", tone = "error", statusLine = "Dictation cancelled. What was already typed stays.")
             return
         }
-        val didTypeIntoAField = typeNewlySpokenWords(words, insertIntoThisApp, isFinalText = true)
+        val finalWords = cleanUpFinishedTranscriptOrKeepItAsSpoken(words)
+        if (wasTakeCancelled) {
+            return
+        }
+        val didTypeIntoAField = typeNewlySpokenWords(finalWords, insertIntoThisApp, isFinalText = true)
         val didFinishTypingInTheSameField = didTypeIntoAField && !didTypingStopBecauseFocusMoved
         if (!didFinishTypingInTheSameField) {
-            copyTextToClipboard(words)
+            copyTextToClipboard(finalWords)
         }
-        rememberTranscript(words, didFinishTypingInTheSameField)
+        rememberTranscript(finalWords, didFinishTypingInTheSameField)
         val statusLine = when {
             didFinishTypingInTheSameField -> "Typed into the focused field."
             lastInsertFailureMessage.isNotBlank() -> lastInsertFailureMessage
             else -> "Copied to the clipboard and saved in Recent."
         }
         val pillTitle = if (didFinishTypingInTheSameField) "Inserted" else "Copied"
-        val pillDetail = if (didFinishTypingInTheSameField) words.take(48) else statusLine.take(80)
+        val pillDetail = if (didFinishTypingInTheSameField) finalWords.take(48) else statusLine.take(80)
         endWithMessage(
             title = pillTitle,
             detail = pillDetail,
@@ -1161,6 +1328,9 @@ class DictationCoordinator {
             return didInsertExternalTextThisTake
         }
         lastInsertFailureMessage = insertOutcome.message
+        if (isFinalText) {
+            recordError("Typing", "The text was not typed into the field (${insertOutcome.method}): ${insertOutcome.message}", logTailOf(File(runtimeDirectory, "dictation-typing.log")))
+        }
         /* For the final text only its own result counts; an earlier live update having landed does not mean the finished sentence did. */
         return if (isFinalText) false else didInsertExternalTextThisTake
     }
@@ -1168,7 +1338,7 @@ class DictationCoordinator {
     /**
      * Turns the take into text without sending older audio to the model again. Once the newest audio passes 25 seconds, it is cut at a pause and the part before the cut is transcribed once and locked in. Only the audio after the last cut is sent on each live update, so updates stay quick and only the last sentence or so can still change.
      *
-     * Live updates skip the newest audio until it holds real speech, because on silence the model tends to guess "Okay.". The final pass of a short take always sends the whole recording, as before.
+     * Live updates skip the newest audio until it holds real speech, because on silence the model tends to guess "Okay.". The final pass of a short take sends the whole recording unless it holds no sound that could be speech, because on silence the model makes up text such as "Thank you." or reads back its own word list.
      */
     private fun transcribeTakeUsingLockedInParts(allSamples: ShortArray, isFinalPass: Boolean): String {
         val languageEnglishName = screenState.selectedLanguageEnglishName
@@ -1189,7 +1359,7 @@ class DictationCoordinator {
         }
         val newestAudio = allSamples.copyOfRange(lockedInAudioSampleCount.coerceAtMost(allSamples.size), allSamples.size)
         val shouldSendNewestAudio = when {
-            isFinalPass && lockedInTranscript.isEmpty() -> newestAudio.isNotEmpty()
+            isFinalPass && lockedInTranscript.isEmpty() -> containsAnySoundThatCouldBeSpeech(newestAudio)
             isFinalPass -> containsSpeech(newestAudio)
             else -> newestAudio.size >= shortestAudioForLiveUpdateInSamples && containsSpeech(newestAudio)
         }
@@ -1201,11 +1371,41 @@ class DictationCoordinator {
         return applyWordReplacements(joinTranscriptParts(lockedInTranscript, newestText), screenState.wordReplacements)
     }
 
+    /**
+     * Tidies a finished take with the LFM3-1.7B text model when text cleanup is on and the model is ready (fillers out, grammar fixed). Otherwise, or when the model fails, is too slow, or changes what was said, returns the words as they were spoken.
+     */
+    private fun cleanUpFinishedTranscriptOrKeepItAsSpoken(spokenWords: String): String {
+        val cleanupModel = transcriptCleanupModel
+        if (!screenState.isTranscriptCleanupEnabled || !isTranscriptCleanupModelReady || cleanupModel == null) {
+            return spokenWords
+        }
+        hotkeyBridge.showPill(
+            title = "Cleaning up",
+            detail = "LFM3-1.7B",
+            tone = "working",
+            microphoneLevel = 0f,
+        )
+        return try {
+            val customWordSpellings = correctSpellingsOfCustomWords(screenState.wordReplacements)
+            val modelReply = cleanupModel.requestCleanedTranscriptFromLocalTextModel(spokenWords, customWordSpellings, java.time.Duration.ofSeconds(10))
+            val cleanedWords = cleanedTranscriptOrOriginalWhenTheModelWentOffScript(spokenWords, modelReply, customWordSpellings)
+            applyWordReplacements(cleanedWords, screenState.wordReplacements)
+        } catch (exception: Exception) {
+            recordError("Text cleanup", "The text was typed without cleanup: ${exception.message ?: exception.javaClass.simpleName}", exception.stackTraceToString())
+            spokenWords
+        }
+    }
+
     private fun transcribeSamplesWithSpeechModel(samples: ShortArray, languageEnglishName: String, wavFileName: String): String {
         val speechTranscriber = transcriber ?: return ""
+        if (wasTakeCancelled) {
+            throw TranscriptionCancelledException()
+        }
         val wavFile = File(runtimeDirectory, "captures/$wavFileName")
         writePcm16MonoWav(wavFile, samples, speechModelSampleRate)
-        return speechTranscriber.transcribeWavFile(wavFile, languageEnglishName).trim()
+        val customWordSpellings = correctSpellingsOfCustomWords(screenState.wordReplacements)
+        val transcript = speechTranscriber.transcribeWavFile(wavFile, languageEnglishName, customWordSpellings)
+        return removeInstructionTheSpeechModelEchoedBack(transcript, customWordSpellings)
     }
 
     private fun joinTranscriptParts(earlierText: String, laterText: String): String {
@@ -1279,7 +1479,7 @@ class DictationCoordinator {
                     if (elapsed >= 900 && now - lastLiveTranscriptionAtMillis >= 1_400 && !isLiveTranscriptionQueued) {
                         lastLiveTranscriptionAtMillis = now
                         isLiveTranscriptionQueued = true
-                        sessionThread.execute {
+                        runOnSessionThread {
                             try {
                                 transcribeWhatHasBeenSaidSoFar()
                             } finally {
@@ -1290,7 +1490,7 @@ class DictationCoordinator {
                 }
                 if (elapsed >= longestTakeInMilliseconds && !didScheduleAutoStop) {
                     didScheduleAutoStop = true
-                    sessionThread.execute {
+                    runOnSessionThread {
                         finishListening()
                     }
                 }
@@ -1322,6 +1522,16 @@ class DictationCoordinator {
         refreshMicrophones()
     }
 
+    /** The last lines of one of Rvoice's log files, for the Error log details. Empty when the file is missing. */
+    private fun logTailOf(logFile: File): String {
+        return runCatching {
+            logFile.readLines().takeLast(25).joinToString("\n")
+        }.getOrDefault("")
+    }
+
+    /**
+     * Starts the dictation model server and waits until it answers. If it quits later on its own, it is restarted (up to three times in a row) and every failure goes to the error log, so Rvoice never keeps recording with nothing to transcribe.
+     */
     private fun prepareSpeechModel() {
         val llamaServerBinary = findLlamaServerBinary()
         if (llamaServerBinary == null) {
@@ -1351,8 +1561,32 @@ class DictationCoordinator {
             logFile = File(runtimeDirectory, "llama-server.log"),
         )
         transcriber = speechTranscriber
+        speechTranscriber.onServerStoppedUnexpectedly = { lastLogLines ->
+            engineIsReady = false
+            recordError("Dictation", "The dictation model stopped unexpectedly.", lastLogLines)
+            speechServerRestartCount++
+            if (speechServerRestartCount <= 3) {
+                updateScreenState { current ->
+                    current.copy(enginePhase = DictationEnginePhase.Starting, engineDetail = "The speech model stopped. Restarting it…")
+                }
+                Thread(
+                    {
+                        prepareSpeechModel()
+                    },
+                    "speech-model-restart",
+                ).apply {
+                    isDaemon = true
+                    start()
+                }
+            } else {
+                updateScreenState { current ->
+                    current.copy(enginePhase = DictationEnginePhase.Failed, engineDetail = "The speech model keeps stopping. See General → Error log.")
+                }
+            }
+        }
         val failure = speechTranscriber.startAndWaitUntilReady()
         if (failure != null) {
+            recordError("Dictation", "The dictation model could not start.", failure)
             engineIsReady = false
             updateScreenState { current ->
                 current.copy(
@@ -1363,7 +1597,10 @@ class DictationCoordinator {
             return
         }
         engineIsReady = true
-        prepareSpeakingVoice()
+        speechServerRestartCount = 0
+        if (speechSpeaker == null) {
+            prepareSpeakingVoice()
+        }
         updateScreenState { current ->
             current.copy(
                 enginePhase = DictationEnginePhase.Ready,
@@ -1374,6 +1611,110 @@ class DictationCoordinator {
                     current.statusLine
                 },
             )
+        }
+    }
+
+    private fun loadTranscriptCleanupModelInTheBackground() {
+        Thread(
+            {
+                loadTranscriptCleanupModel()
+            },
+            "transcript-cleanup-model",
+        ).apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    /**
+     * Starts the LFM3-1.7B cleanup server and waits until it answers. Does nothing if it is already loaded. If it later quits on its own, it is restarted up to three times in a row; meanwhile dictations are typed without cleanup.
+     */
+    private fun loadTranscriptCleanupModel() {
+        synchronized(transcriptCleanupModelLock) {
+            if (transcriptCleanupModel != null || !screenState.isTranscriptCleanupEnabled) {
+                return
+            }
+            val llamaServerBinary = findLlamaServerBinary()
+            if (llamaServerBinary == null || !transcriptCleanupModelFile.isFile) {
+                updateScreenState { current ->
+                    current.copy(
+                        transcriptCleanupStatus = if (llamaServerBinary == null) {
+                            "llama.cpp is not installed. Install it with: brew install llama.cpp"
+                        } else {
+                            "The model file is missing. Download LFM3-1.7B-Q8_0.gguf from LiquidAI/LFM3-1.7B-GGUF into ${transcriptCleanupModelFile.parent}."
+                        },
+                    )
+                }
+                return
+            }
+            updateScreenState { current ->
+                current.copy(transcriptCleanupStatus = "Loading LFM3-1.7B…")
+            }
+            val cleanupModel = LlamaServerTranscriptCleanupModel(
+                llamaServerBinary = llamaServerBinary,
+                modelFile = transcriptCleanupModelFile,
+                logFile = File(runtimeDirectory, "cleanup-server.log"),
+            )
+            cleanupModel.onServerStoppedUnexpectedly = { lastLogLines ->
+                restartTranscriptCleanupModelAfterItStopped(cleanupModel, lastLogLines)
+            }
+            transcriptCleanupModel = cleanupModel
+            val failure = cleanupModel.startAndWaitUntilReady()
+            if (failure != null) {
+                cleanupModel.shutdown()
+                transcriptCleanupModel = null
+                recordError("Text cleanup", "The text cleanup model could not start.", failure)
+                updateScreenState { current ->
+                    current.copy(transcriptCleanupStatus = "Could not start, so dictations are typed as spoken. See General → Error log.")
+                }
+                return
+            }
+            isTranscriptCleanupModelReady = true
+            transcriptCleanupServerRestartCount = 0
+            updateScreenState { current ->
+                current.copy(transcriptCleanupStatus = "LFM3-1.7B is loaded on this Mac.")
+            }
+        }
+    }
+
+    private fun restartTranscriptCleanupModelAfterItStopped(stoppedCleanupModel: LlamaServerTranscriptCleanupModel, lastLogLines: String) {
+        synchronized(transcriptCleanupModelLock) {
+            if (transcriptCleanupModel !== stoppedCleanupModel) {
+                return
+            }
+            isTranscriptCleanupModelReady = false
+            transcriptCleanupModel = null
+        }
+        recordError("Text cleanup", "The text cleanup model stopped unexpectedly.", lastLogLines)
+        transcriptCleanupServerRestartCount++
+        if (transcriptCleanupServerRestartCount <= 3) {
+            loadTranscriptCleanupModelInTheBackground()
+        } else {
+            updateScreenState { current ->
+                current.copy(transcriptCleanupStatus = "Keeps stopping, so dictations are typed as spoken. Turn cleanup off and on to try again.")
+            }
+        }
+    }
+
+    /** Stops the cleanup server in the background. If it is still loading, it is stopped as soon as loading finishes, so the window never waits on it. */
+    private fun unloadTranscriptCleanupModelInTheBackground() {
+        isTranscriptCleanupModelReady = false
+        Thread(
+            {
+                synchronized(transcriptCleanupModelLock) {
+                    if (screenState.isTranscriptCleanupEnabled) {
+                        return@Thread
+                    }
+                    isTranscriptCleanupModelReady = false
+                    transcriptCleanupModel?.shutdown()
+                    transcriptCleanupModel = null
+                    transcriptCleanupServerRestartCount = 0
+                }
+            },
+            "transcript-cleanup-model-unload",
+        ).apply {
+            isDaemon = true
+            start()
         }
     }
 
@@ -1419,6 +1760,7 @@ class DictationCoordinator {
                 shortcutModifiers = saved.optInt("shortcutModifiers", current.shortcutModifiers),
                 shortcutLabel = saved.optString("shortcutLabel", current.shortcutLabel),
                 openAtLogin = macLoginItem.isEnabled(),
+                isTranscriptCleanupEnabled = saved.optBoolean("isTranscriptCleanupEnabled", current.isTranscriptCleanupEnabled),
                 appearanceMode = saved.optString("appearanceMode", current.appearanceMode),
                 selectedMicrophoneId = saved.optString("selectedMicrophoneId", current.selectedMicrophoneId),
                 selectedMicrophoneName = saved.optString("selectedMicrophoneName", current.selectedMicrophoneName),
@@ -1455,6 +1797,7 @@ class DictationCoordinator {
             saved.put("shortcutModifiers", snapshot.shortcutModifiers)
             saved.put("shortcutLabel", snapshot.shortcutLabel)
             saved.put("openAtLogin", snapshot.openAtLogin)
+            saved.put("isTranscriptCleanupEnabled", snapshot.isTranscriptCleanupEnabled)
             saved.put("appearanceMode", snapshot.appearanceMode)
             saved.put("selectedMicrophoneId", snapshot.selectedMicrophoneId)
             saved.put("selectedMicrophoneName", snapshot.selectedMicrophoneName)
@@ -1546,7 +1889,14 @@ class DictationCoordinator {
         clipboard.setContents(StringSelection(text), null)
     }
 
+    /** Builds the project's helper from source when it is out of date. Skipped in the packaged app, which carries its own ready-built helper. */
     private fun ensureHelperBinaryIsBuilt() {
+        val isRunningAsPackagedApp = System.getProperty("compose.application.resources.dir")?.let { resourcesDirectory ->
+            File(resourcesDirectory, "RvoiceHelper.app").isDirectory
+        } == true
+        if (isRunningAsPackagedApp) {
+            return
+        }
         val sourceFile = File(projectRoot, "native/macos/GlobalDictationHelper.swift")
         val infoPlistFile = File(projectRoot, "native/macos/HelperInfo.plist")
         val launcherSourceFile = File(projectRoot, "native/macos/launch-dictation-helper.c")

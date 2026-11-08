@@ -155,6 +155,7 @@ fun DictationScreen(
     onCopyTranscript: (String) -> Unit,
     onBeginShortcutRecording: () -> Unit,
     onOpenAtLoginChange: (Boolean) -> Unit,
+    onTranscriptCleanupChange: (Boolean) -> Unit,
     onAppearanceSelected: (String) -> Unit,
     onMicrophoneSelected: (microphoneId: String, microphoneName: String) -> Unit,
     onAddWordReplacement: (misheardSpellingsText: String, correctWord: String) -> Unit,
@@ -178,6 +179,8 @@ fun DictationScreen(
     onSkipSavedAudioPlayback: (seconds: Int) -> Unit,
     onSeekSavedAudioPlayback: (positionInSeconds: Double) -> Unit,
     onCloseSavedAudioPlayer: () -> Unit,
+    onCopyErrorLogEntry: (ErrorLogEntry) -> Unit,
+    onClearErrorLog: () -> Unit,
 ) {
     val useDarkColors = when (screenState.appearanceMode) {
         "light" -> false
@@ -296,11 +299,17 @@ fun DictationScreen(
                                 onAppearanceSelected = onAppearanceSelected,
                             )
                             SettingsTab.GeneralModel -> GeneralModelTab(screenState = screenState)
+                            SettingsTab.GeneralErrorLog -> ErrorLogTab(
+                                errorLogEntries = screenState.errorLogEntries,
+                                onCopyErrorLogEntry = onCopyErrorLogEntry,
+                                onClearErrorLog = onClearErrorLog,
+                            )
                             SettingsTab.VoiceDictation -> VoiceDictationTab(
                                 screenState = screenState,
                                 onLanguageSelected = onLanguageSelected,
                                 onDraftChange = onDraftChange,
                                 onMicrophoneSelected = onMicrophoneSelected,
+                                onTranscriptCleanupChange = onTranscriptCleanupChange,
                             )
                             SettingsTab.VoiceWordReplacements -> WordReplacementsPage(
                                 wordReplacements = screenState.wordReplacements,
@@ -378,6 +387,7 @@ private enum class SettingsPage(val sidebarLabel: String, val pageDescription: S
 private enum class SettingsTab(val page: SettingsPage, val tabLabel: String) {
     GeneralSettings(SettingsPage.General, "Settings"),
     GeneralModel(SettingsPage.General, "Model"),
+    GeneralErrorLog(SettingsPage.General, "Error log"),
     VoiceDictation(SettingsPage.Voice, "Dictation"),
     VoiceWordReplacements(SettingsPage.Voice, "Word replacements"),
     VoiceTranscriptions(SettingsPage.Voice, "Transcriptions"),
@@ -454,6 +464,7 @@ private fun PageTitleAndTabs(
                     SettingsTab.VoiceWordReplacements -> screenState.wordReplacements.size
                     SettingsTab.VoiceTranscriptions -> screenState.transcriptHistory.size
                     SettingsTab.SpeechSavedAudio -> screenState.savedSpeechAudioFiles.size
+                    SettingsTab.GeneralErrorLog -> screenState.errorLogEntries.size
                     else -> 0
                 }
                 Row(
@@ -696,11 +707,104 @@ private fun GeneralModelTab(screenState: DictationScreenState) {
         onAction = null,
     )
     NoticeCard(
+        title = "Text cleanup",
+        body = screenState.transcriptCleanupStatus,
+        actionLabel = null,
+        onAction = null,
+    )
+    NoticeCard(
         title = "Reading aloud",
         body = screenState.speakingVoiceProblem ?: if (screenState.isSpeakingVoiceReady) "Loaded and ready." else "Loading…",
         actionLabel = null,
         onAction = null,
     )
+}
+
+/**
+ * Problems Rvoice ran into in the last seven days, newest first. Clicking an entry shows its details (log lines, error traces); the copy button copies it for a bug report.
+ */
+@Composable
+private fun ErrorLogTab(
+    errorLogEntries: List<ErrorLogEntry>,
+    onCopyErrorLogEntry: (ErrorLogEntry) -> Unit,
+    onClearErrorLog: () -> Unit,
+) {
+    val palette = LocalMacPalette.current
+    var expandedEntryTimes by remember { mutableStateOf(setOf<Long>()) }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            text = "Problems from the last seven days. Older ones are deleted. Click an entry to see its details.",
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.weight(1f),
+        )
+        if (errorLogEntries.isNotEmpty()) {
+            TextButton(onClick = onClearErrorLog) {
+                Text("Clear all", color = palette.recording)
+            }
+        }
+    }
+    if (errorLogEntries.isEmpty()) {
+        EmptyListMessage(title = "No errors", body = "When something goes wrong, it shows up here with the details.")
+        return
+    }
+    SettingsGroup {
+        errorLogEntries.forEachIndexed { rowIndex, errorLogEntry ->
+            if (rowIndex > 0) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 14.dp)
+                        .height(1.dp)
+                        .background(palette.separator),
+                )
+            }
+            val isExpanded = errorLogEntry.occurredAtEpochMilliseconds in expandedEntryTimes
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                    ) {
+                        expandedEntryTimes = if (isExpanded) {
+                            expandedEntryTimes - errorLogEntry.occurredAtEpochMilliseconds
+                        } else {
+                            expandedEntryTimes + errorLogEntry.occurredAtEpochMilliseconds
+                        }
+                    }
+                    .padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "${errorLogEntry.area}  ·  ${errorLogEntry.occurredAtLabel}",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(text = errorLogEntry.message, style = MaterialTheme.typography.bodyLarge)
+                    }
+                    IconActionButton(icon = Icons.Outlined.ContentCopy, description = "Copy this error", tint = palette.accent) {
+                        onCopyErrorLogEntry(errorLogEntry)
+                    }
+                }
+                if (isExpanded && errorLogEntry.details.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = errorLogEntry.details,
+                        color = palette.secondary,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        lineHeight = 15.sp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(palette.field)
+                            .padding(10.dp),
+                    )
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -712,6 +816,7 @@ private fun VoiceDictationTab(
     onLanguageSelected: (DictationLanguage) -> Unit,
     onDraftChange: (text: String, selectionStart: Int, selectionEnd: Int) -> Unit,
     onMicrophoneSelected: (microphoneId: String, microphoneName: String) -> Unit,
+    onTranscriptCleanupChange: (Boolean) -> Unit,
 ) {
     val palette = LocalMacPalette.current
     TabIntroduction(text = "Press ${screenState.shortcutLabel} in any text field, speak, then press it again. Press Escape to stop and keep only what is already typed.")
@@ -731,6 +836,11 @@ private fun VoiceDictationTab(
     LanguagePicker(
         selectedLanguageEnglishName = screenState.selectedLanguageEnglishName,
         onLanguageSelected = onLanguageSelected,
+    )
+    TranscriptCleanupRow(
+        isChecked = screenState.isTranscriptCleanupEnabled,
+        transcriptCleanupStatus = screenState.transcriptCleanupStatus,
+        onCheckedChange = onTranscriptCleanupChange,
     )
     Text(
         text = "Try it in this box",
@@ -1370,6 +1480,56 @@ private fun LoginRow(
                 text = "Open Rvoice when you log in",
                 style = MaterialTheme.typography.bodyLarge,
             )
+        }
+    }
+}
+
+/**
+ * The on/off switch for tidying each finished dictation with the LFM3-1.7B text model, with a line saying whether that model is ready.
+ */
+@Composable
+private fun TranscriptCleanupRow(
+    isChecked: Boolean,
+    transcriptCleanupStatus: String,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    val palette = LocalMacPalette.current
+    SettingsGroup {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Checkbox(
+                checked = isChecked,
+                onCheckedChange = { checked ->
+                    onCheckedChange(checked)
+                },
+                colors = CheckboxDefaults.colors(
+                    checkedColor = palette.accent,
+                    checkmarkColor = palette.onAccent,
+                    uncheckedColor = palette.secondary,
+                ),
+            )
+            Column(modifier = Modifier.padding(vertical = 6.dp)) {
+                Text(
+                    text = "Clean up text when you finish",
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+                Text(
+                    text = "Removes filler words like \"um\" and fixes grammar and punctuation, keeping your own words. Words appear as you speak, then get tidied when you stop.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = palette.secondary,
+                )
+                if (isChecked) {
+                    Text(
+                        text = transcriptCleanupStatus,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = palette.secondary,
+                    )
+                }
+            }
         }
     }
 }

@@ -42,6 +42,9 @@ data class DictationTranscriptEntry(
  * @property isSpeakingVoiceReady True once the speaking model has loaded.
  * @property speakingVoiceProblem Why the speaking model could not start, or null when it is fine or still loading.
  * @property savedAudioPlayer What the built-in MP3 player is playing, or null when it is closed.
+ * @property errorLogEntries Problems from the last seven days, newest first, for the Error log tab.
+ * @property isTranscriptCleanupEnabled True when a finished dictation is tidied by the LFM3-1.7B text model (fillers removed, grammar fixed) before it is typed.
+ * @property transcriptCleanupStatus Whether that text model is loading, ready, missing or failed, in words for the settings page.
  */
 data class DictationScreenState(
     val enginePhase: DictationEnginePhase,
@@ -59,6 +62,7 @@ data class DictationScreenState(
     val isSpeakingVoiceReady: Boolean,
     val speakingVoiceProblem: String?,
     val savedAudioPlayer: SavedAudioPlayerState?,
+    val errorLogEntries: List<ErrorLogEntry>,
     val selectedSpeakingVoiceId: String,
     val isSpeechPaused: Boolean,
     val speakingSpeed: Float,
@@ -73,6 +77,8 @@ data class DictationScreenState(
     val shortcutLabel: String,
     val isRecordingShortcut: Boolean,
     val openAtLogin: Boolean,
+    val isTranscriptCleanupEnabled: Boolean,
+    val transcriptCleanupStatus: String,
     val appearanceMode: String,
     val transcriptHistory: List<DictationTranscriptEntry>,
     val wordReplacements: List<WordReplacement>,
@@ -99,6 +105,7 @@ fun initialDictationScreenState(): DictationScreenState {
         isSpeakingVoiceReady = false,
         speakingVoiceProblem = null,
         savedAudioPlayer = null,
+        errorLogEntries = emptyList(),
         selectedSpeakingVoiceId = "american-female",
         isSpeechPaused = false,
         speakingSpeed = 1f,
@@ -113,6 +120,8 @@ fun initialDictationScreenState(): DictationScreenState {
         shortcutLabel = defaultDictationShortcut().label,
         isRecordingShortcut = false,
         openAtLogin = false,
+        isTranscriptCleanupEnabled = true,
+        transcriptCleanupStatus = "Loading LFM3-1.7B…",
         appearanceMode = "dark",
         transcriptHistory = emptyList(),
         wordReplacements = emptyList(),

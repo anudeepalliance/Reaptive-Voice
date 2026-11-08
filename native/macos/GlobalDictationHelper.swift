@@ -40,6 +40,76 @@ func textSafeForTerminal(_ text: String) -> String {
     return collapsedText
 }
 
+/// Words as they are compared when lining up two versions of a transcript: lower case, without punctuation.
+private func wordForComparing(_ word: Substring) -> String {
+    word.lowercased().filter { character in
+        character.isLetter || character.isNumber
+    }
+}
+
+/// True when two different words are probably the model's two guesses at the same spoken word, such as "wor" and "world" or "their" and "there".
+private func wordsLookLikeTheSameSpokenWord(_ firstWord: String, _ secondWord: String) -> Bool {
+    if min(firstWord.count, secondWord.count) >= 2 && (firstWord.hasPrefix(secondWord) || secondWord.hasPrefix(firstWord)) {
+        return true
+    }
+    let firstCharacters = Array(firstWord)
+    let secondCharacters = Array(secondWord)
+    var previousRow = Array(0...secondCharacters.count)
+    for firstIndex in 0..<firstCharacters.count {
+        var currentRow = [firstIndex + 1] + Array(repeating: 0, count: secondCharacters.count)
+        for secondIndex in 0..<secondCharacters.count {
+            let replaceCost = firstCharacters[firstIndex] == secondCharacters[secondIndex] ? 0 : 1
+            currentRow[secondIndex + 1] = min(previousRow[secondIndex] + replaceCost, previousRow[secondIndex + 1] + 1, currentRow[secondIndex] + 1)
+        }
+        previousRow = currentRow
+    }
+    return previousRow[secondCharacters.count] * 2 <= max(firstCharacters.count, secondCharacters.count)
+}
+
+/**
+ * The end of the latest transcript that is not in the field yet, given the words already there that can no longer be changed. The model often rewords as it hears more, so the two are lined up word by word, allowing for changed, merged and added words, instead of being compared letter by letter. When it is unclear whether a word was already typed, it counts as not typed, because a repeated word is better than a lost one.
+ */
+func transcriptPartNotYetTyped(latestTranscript: String, wordsAlreadyInField: String) -> String {
+    let alreadyTypedWords = wordsAlreadyInField.split(whereSeparator: \.isWhitespace)
+    let latestWords = latestTranscript.split(whereSeparator: \.isWhitespace)
+    if alreadyTypedWords.isEmpty {
+        return latestTranscript
+    }
+    var matchingWordCount = 0
+    while matchingWordCount < alreadyTypedWords.count, matchingWordCount < latestWords.count,
+          wordForComparing(alreadyTypedWords[matchingWordCount]) == wordForComparing(latestWords[matchingWordCount]) {
+        matchingWordCount += 1
+    }
+    let typedWordsToLineUp = alreadyTypedWords[matchingWordCount...].map(wordForComparing)
+    let latestWordsToLineUp = latestWords[matchingWordCount...].prefix(typedWordsToLineUp.count * 2 + 10).map(wordForComparing)
+    let costOfSimilarWord = 1
+    let costOfDifferentWord = 3
+    let costOfWordOnlyInField = 3
+    let costOfWordOnlyInLatest = 1
+    var previousRow = (0...latestWordsToLineUp.count).map { latestWordIndex in
+        latestWordIndex * costOfWordOnlyInLatest
+    }
+    for typedWord in typedWordsToLineUp {
+        var currentRow = [previousRow[0] + costOfWordOnlyInField] + Array(repeating: 0, count: latestWordsToLineUp.count)
+        for (latestWordIndex, latestWord) in latestWordsToLineUp.enumerated() {
+            let replaceCost = typedWord == latestWord ? 0 : (wordsLookLikeTheSameSpokenWord(typedWord, latestWord) ? costOfSimilarWord : costOfDifferentWord)
+            currentRow[latestWordIndex + 1] = min(
+                previousRow[latestWordIndex] + replaceCost,
+                previousRow[latestWordIndex + 1] + costOfWordOnlyInField,
+                currentRow[latestWordIndex] + costOfWordOnlyInLatest
+            )
+        }
+        previousRow = currentRow
+    }
+    let lowestCost = previousRow.min() ?? 0
+    let lineUpEndIndex = previousRow.firstIndex(of: lowestCost) ?? 0
+    let firstUntypedWordIndex = typedWordsToLineUp.isEmpty ? matchingWordCount : matchingWordCount + lineUpEndIndex
+    if firstUntypedWordIndex >= latestWords.count {
+        return ""
+    }
+    return String(latestTranscript[latestWords[firstUntypedWordIndex].startIndex...])
+}
+
 /// Listens for ⌘D anywhere on the Mac, remembers the text field that was focused, and later types the transcript into that field. It also draws the small listening pill. The pill is a non-activating panel, so it does not pull focus away from the app the person was typing in.
 final class DictationHelper: NSObject {
     static let shared = DictationHelper()
@@ -54,6 +124,14 @@ final class DictationHelper: NSObject {
     /// Where in the field this take's text starts (in UTF-16 units), read just before the first words are typed. Nil when the app does not report it.
     private var takeTextStartLocationInField: Int?
     private var mayCursorHaveMovedInTheTakesField = false
+    /// True when the person pressed a typing key in the take's app since Rvoice last typed. Their key now sits after Rvoice's words, so Backspace can no longer reach those words.
+    private var didPersonTypeInTheTakesField = false
+    /// This take's words from before the person's key press. They stay as they are; only words after them still get typed.
+    private var wordsLeftBehindInTheField = ""
+    /// What is just left of the cursor, as far as Rvoice can tell from its own words and the keys pressed. Decides whether new words need a space first. Kept in memory only, for this take only.
+    private var textKnownLeftOfTheCursor = ""
+    /// Whether the stretch of words now being typed began with a space, so that later corrections keep it.
+    private var doesThisStretchStartWithASpace = false
     private var clickAndKeyWatcher: Any?
     private var clipboardTextBeforeTake: String?
     private var didSaveClipboardForTake = false
@@ -69,7 +147,17 @@ final class DictationHelper: NSObject {
     )
     private let parentProcessId: pid_t
     private var lastAccessibilityTrusted = false
-    private let pillPanel = ListeningPillPanel()
+    /// Replaced with a fresh panel whenever macOS stops putting the old one on screen (seen after Rvoice had run for hours).
+    private var pillPanel = ListeningPillPanel()
+
+    /// When the pill was last checked against the windows macOS is really showing, so the check runs at most a few times a second.
+    private var lastPillOnScreenCheckAt = Date.distantPast
+
+    /// When the pill last went from hidden to shown; nil while it is hidden. The on-screen check waits a moment after this, because macOS needs time to put a new window up.
+    private var pillShownSince: Date?
+
+    /// Set after sleep, a display change or a desktop switch, so the next pill update builds a new window.
+    private var shouldRebuildPillOnNextUpdate = false
 
     private override init() {
         let parentFromEnvironment = ProcessInfo.processInfo.environment["REAPTIVE_VOICE_PARENT_PID"].flatMap { pidString in
@@ -82,6 +170,7 @@ final class DictationHelper: NSObject {
     func start() {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
+        rebuildPillAfterSleepDisplayOrDesktopChanges()
         lastAccessibilityTrusted = AXIsProcessTrusted()
         if !lastAccessibilityTrusted {
             promptForAccessibility()
@@ -213,7 +302,7 @@ final class DictationHelper: NSObject {
         return "Using a keyboard tap instead."
     }
 
-    /// Notices when the person clicks or types after this take has started typing. Either one can move the cursor, and Rvoice's erase-and-retype only works while the cursor is still right after its own words, so it stops typing for the rest of the take. Keys Rvoice posts itself and the dictation shortcut are ignored.
+    /// Notices the person's clicks and key presses during a take. Rvoice's corrections erase with Backspace, which only works while the cursor is still right after its own words. Keys Rvoice posts itself and the dictation shortcut are ignored.
     private func watchForClicksAndKeysFromThePerson() {
         clickAndKeyWatcher = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown]
@@ -228,7 +317,7 @@ final class DictationHelper: NSObject {
             cancelDictationBecauseEscapeWasPressed()
             return
         }
-        if previouslyTypedText.isEmpty {
+        if mode == "idle" {
             return
         }
         if event.type == .keyDown {
@@ -244,7 +333,66 @@ final class DictationHelper: NSObject {
         if processThatReceivedThisTake != 0 && appThatReceivesEvent(event) != processThatReceivedThisTake {
             return
         }
-        mayCursorHaveMovedInTheTakesField = true
+        if event.type == .keyDown && keyOnlyChangesTextAtTheCursor(event) {
+            rememberKeyTypedByThePerson(event)
+            return
+        }
+        /* A click or a shortcut such as ⌘T can put the person in another field, where this take's words do not belong. */
+        if !previouslyTypedText.isEmpty || !wordsLeftBehindInTheField.isEmpty {
+            mayCursorHaveMovedInTheTakesField = true
+        }
+    }
+
+    /// False for ⌘ and ⌃ shortcuts and for Tab, which can move focus to another field. Everything else stays in the field: letters, Return, Backspace and arrow keys.
+    private func keyOnlyChangesTextAtTheCursor(_ event: NSEvent) -> Bool {
+        let tabKeyCode: UInt16 = 48
+        let flags = event.cgEvent?.flags ?? []
+        return event.keyCode != tabKeyCode && !flags.contains(.maskCommand) && !flags.contains(.maskControl)
+    }
+
+    /// Notes a key the person pressed in the take's field, so the next words go after it instead of Backspace erasing it. Keys that change nothing left of the cursor, such as F1 or forward delete, are ignored.
+    private func rememberKeyTypedByThePerson(_ event: NSEvent) {
+        let backspaceKeyCode: UInt16 = 51
+        let keyCodesThatMoveTheCursor: Set<UInt16> = [123, 124, 125, 126, 115, 119, 116, 121]
+        if event.keyCode == backspaceKeyCode {
+            if !textKnownLeftOfTheCursor.isEmpty {
+                textKnownLeftOfTheCursor.removeLast()
+            }
+        } else if keyCodesThatMoveTheCursor.contains(event.keyCode) {
+            textKnownLeftOfTheCursor = ""
+        } else {
+            let typedCharacters = event.characters ?? ""
+            let isFunctionKey = typedCharacters.unicodeScalars.contains { scalar in
+                (0xF700...0xF8FF).contains(scalar.value)
+            }
+            if isFunctionKey {
+                return
+            }
+            textKnownLeftOfTheCursor += typedCharacters
+        }
+        didPersonTypeInTheTakesField = true
+    }
+
+    /**
+     * Works out what to type now. After the person typed in the field, the words already there are left alone and only the words after them are typed, starting a new stretch right after the person's key. Returns an empty text when every word is already in the field.
+     */
+    private func textToTypeAfterAnyKeysThePersonPressed(_ text: String) -> String {
+        if didPersonTypeInTheTakesField {
+            wordsLeftBehindInTheField += previouslyTypedText
+            previouslyTypedText = ""
+            takeTextStartLocationInField = nil
+            didPersonTypeInTheTakesField = false
+        }
+        if previouslyTypedText.isEmpty {
+            doesThisStretchStartWithASpace = textKnownLeftOfTheCursor.last.map { lastCharacter in
+                !lastCharacter.isWhitespace
+            } ?? false
+        }
+        let wordsNotYetTyped = transcriptPartNotYetTyped(latestTranscript: text, wordsAlreadyInField: wordsLeftBehindInTheField)
+        if wordsNotYetTyped.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return ""
+        }
+        return doesThisStretchStartWithASpace ? " " + wordsNotYetTyped : wordsNotYetTyped
     }
 
     /// Which app a click or key press goes to: for a click, the owner of the window under it; for a key press, the app in front.
@@ -309,6 +457,15 @@ final class DictationHelper: NSObject {
     }
 
     /// Escape during a dictation stops it where it is: what is already typed stays, nothing more is typed. The app throws the rest of the recording away and then sets this helper back to idle.
+    /// The ✕ on the listening pill: cancels this dictation exactly as Escape does.
+    func cancelDictationBecauseThePillCrossWasClicked() {
+        guard mode == "listening" else {
+            askAppToCancelWhatThePillShows()
+            return
+        }
+        cancelDictationBecauseEscapeWasPressed()
+    }
+
     private func cancelDictationBecauseEscapeWasPressed() {
         mode = "busy"
         mayCursorHaveMovedInTheTakesField = true
@@ -433,17 +590,22 @@ final class DictationHelper: NSObject {
         case "pill":
             if object["hide"] as? Bool == true {
                 pillPanel.orderOut(nil)
+                pillShownSince = nil
                 return
             }
             let title = object["title"] as? String ?? ""
             let detail = object["detail"] as? String ?? ""
             let tone = object["tone"] as? String ?? "listening"
             let level = (object["level"] as? NSNumber)?.doubleValue ?? 0
+            if pillShownSince == nil || shouldRebuildPillOnNextUpdate {
+                swapInAFreshPillWindow()
+            }
             if tone == "speaking" && pillPanel.isVisible == false {
                 let mouseLocation = NSEvent.mouseLocation
                 pillPanel.textCursorRectOnScreen = NSRect(x: mouseLocation.x, y: mouseLocation.y - 10, width: 1, height: 20)
             }
             pillPanel.update(title: title, detail: detail, tone: tone, level: CGFloat(level))
+            replacePillIfMacOSIsNotShowingIt(title: title, detail: detail, tone: tone, level: CGFloat(level))
         default:
             break
         }
@@ -471,9 +633,15 @@ final class DictationHelper: NSObject {
             emitInserted(ok: true, method: "compose-window", message: "", verified: true)
             return
         }
-        if !previouslyTypedText.isEmpty && mayCursorHaveMovedInTheTakesField {
+        if mayCursorHaveMovedInTheTakesField {
             appendTypingLog("method=skipped-caret-moved owner=\(owner) expected=\(processThatReceivedThisTake)")
-            emitInserted(ok: false, method: "caret-moved", message: "You clicked or typed in that app while speaking, so Rvoice stopped typing. The full text is on the clipboard.", verified: false)
+            emitInserted(ok: false, method: "caret-moved", message: "You clicked or used a shortcut in that app while speaking, so Rvoice stopped typing. The full text is on the clipboard.", verified: false)
+            return
+        }
+        let textToType = textToTypeAfterAnyKeysThePersonPressed(text)
+        if textToType.isEmpty {
+            appendTypingLog("method=nothing-new length=\(text.count)")
+            emitInserted(ok: true, method: "nothing-new", message: "", verified: false)
             return
         }
         if processThatReceivedThisTake == 0 {
@@ -484,14 +652,14 @@ final class DictationHelper: NSObject {
                 emitInserted(ok: false, method: "waiting-for-final", message: "", verified: false)
                 return
             }
-            let returnResult = finishTakeInItsOwnFieldFromAnotherApp(text)
+            let returnResult = finishTakeInItsOwnFieldFromAnotherApp(textToType)
             emitInserted(ok: returnResult.didLand, method: returnResult.method, message: returnResult.didLand ? "" : returnResult.message, verified: returnResult.verified)
             return
         }
         if previouslyTypedText.isEmpty, let element {
             takeTextStartLocationInField = selectedTextRange(of: element)?.location
         }
-        let writeResult = replaceDictatedText(with: text, owner: owner, element: element)
+        let writeResult = replaceDictatedText(with: textToType, owner: owner, element: element)
         emitInserted(
             ok: writeResult.didLand,
             method: writeResult.method,
@@ -506,7 +674,7 @@ final class DictationHelper: NSObject {
     private func finishTakeInItsOwnFieldFromAnotherApp(_ text: String) -> DictationWriteResult {
         let takeAppBundleIdentifier = NSRunningApplication(processIdentifier: processThatReceivedThisTake)?.bundleIdentifier ?? ""
         let isTerminal = terminalBundleIdentifiers.contains(takeAppBundleIdentifier) || focusedElementLooksLikeTerminal(capturedTextElement)
-        if !isTerminal, writeFinalTextStraightIntoTheTakesField(text) {
+        if !isTerminal, appAppliesAccessibilityTextEdits(takeAppBundleIdentifier), writeFinalTextStraightIntoTheTakesField(text) {
             appendTypingLog("method=background-accessibility verified=true length=\(text.count) bundle=\(takeAppBundleIdentifier)")
             return DictationWriteResult(didLand: true, verified: true, method: "background-accessibility", message: "")
         }
@@ -647,6 +815,10 @@ final class DictationHelper: NSObject {
         windowOfTheTakesField = nil
         takeTextStartLocationInField = nil
         mayCursorHaveMovedInTheTakesField = false
+        didPersonTypeInTheTakesField = false
+        wordsLeftBehindInTheField = ""
+        textKnownLeftOfTheCursor = ""
+        doesThisStretchStartWithASpace = false
         guard shouldRestore else {
             return
         }
@@ -676,7 +848,7 @@ final class DictationHelper: NSObject {
         let message: String
     }
 
-    /// Replaces the words this take already typed with the latest, fuller transcript. Only the part that changed is erased (with Backspace) and pasted again, so earlier words stay put and the update is quick.
+    /// Replaces the words this take already typed with the latest, fuller transcript. Only the part that changed is erased (with Backspace) and pasted again, so earlier words stay put and the update is quick. In terminals the new words are typed as key presses instead of pasted, see typeTextAsKeystrokes.
     ///
     /// When the field's text can be read back (most editors and browsers), the result is checked. Terminals and some apps do not share their text with macOS, so there the keystrokes are trusted instead; otherwise every live update would look like a failure and paste the sentence again on top of itself.
     private func replaceDictatedText(with text: String, owner: pid_t, element: AXUIElement?) -> DictationWriteResult {
@@ -704,7 +876,11 @@ final class DictationHelper: NSObject {
             pastedPart = String(textToType.dropFirst(unchangedCharacterCount))
             deleteCharacters(charactersToErase, source: source)
             if !pastedPart.isEmpty {
-                pasteText(pastedPart, source: source)
+                if isTerminal {
+                    typeTextAsKeystrokes(pastedPart, source: source)
+                } else {
+                    pasteText(pastedPart, source: source)
+                }
             }
             if isTerminal {
                 method = "terminal-keys"
@@ -715,6 +891,7 @@ final class DictationHelper: NSObject {
             }
         }
         previouslyTypedText = textToType
+        textKnownLeftOfTheCursor = textToType
         if !canReadFieldBack {
             appendTypingLog(
                 "method=\(method) verified=false erased-and-pasted=\(pastedPart.count) length=\(textToType.count) bundle=\(bundleIdentifier)"
@@ -734,7 +911,7 @@ final class DictationHelper: NSObject {
             return DictationWriteResult(didLand: true, verified: true, method: method, message: "")
         }
         let didFieldStayExactlyTheSame = readBack == fieldTextBeforeTyping
-        if !pastedPart.isEmpty, didFieldStayExactlyTheSame, let freshElement = copyFocusedElement() {
+        if !pastedPart.isEmpty, didFieldStayExactlyTheSame, appAppliesAccessibilityTextEdits(bundleIdentifier), let freshElement = copyFocusedElement() {
             AXUIElementSetAttributeValue(
                 freshElement,
                 kAXSelectedTextAttribute as CFString,
@@ -747,6 +924,26 @@ final class DictationHelper: NSObject {
             }
         }
         return DictationWriteResult(didLand: false, verified: false, method: method, message: insertFailureMessage())
+    }
+
+    /**
+     * False for apps that show text written through Accessibility without really receiving it. IntelliJ's terminal, for example, displays the words but never passes them to the program running inside, so they vanish on the next key press. Those apps only get real keystrokes.
+     */
+    private func appAppliesAccessibilityTextEdits(_ bundleIdentifier: String) -> Bool {
+        let appsThatOnlyDisplayAccessibilityEdits = [
+            "com.jetbrains.",
+            "com.google.android.studio",
+            "com.microsoft.VSCode",
+            "com.todesktop.",
+            "com.visualstudio.",
+            "dev.zed.",
+        ]
+        if terminalBundleIdentifiers.contains(bundleIdentifier) {
+            return false
+        }
+        return !appsThatOnlyDisplayAccessibilityEdits.contains { bundleIdentifierPrefix in
+            bundleIdentifier.hasPrefix(bundleIdentifierPrefix)
+        }
     }
 
     private let terminalBundleIdentifiers: Set<String> = [
@@ -787,14 +984,66 @@ final class DictationHelper: NSObject {
         return false
     }
 
+    /// Sends Backspace the given number of times in a quick burst (about 1.5 ms apart instead of the 18 ms used for other keys), so a correction does not visibly erase letter by letter.
     private func deleteCharacters(_ characterCount: Int, source: CGEventSource) {
         if characterCount <= 0 {
             return
         }
+        let backspaceKeyCode: CGKeyCode = 0x33
+        let keyboardType = Int64(LMGetKbdType())
         for _ in 0..<characterCount {
-            postKey(virtualKey: 0x33, flags: [], source: source)
+            guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: backspaceKeyCode, keyDown: true),
+                  let keyUp = CGEvent(keyboardEventSource: source, virtualKey: backspaceKeyCode, keyDown: false) else {
+                continue
+            }
+            keyDown.flags = []
+            keyUp.flags = []
+            keyDown.setIntegerValueField(.keyboardEventKeyboardType, value: keyboardType)
+            keyUp.setIntegerValueField(.keyboardEventKeyboardType, value: keyboardType)
+            keyDown.post(tap: .cghidEventTap)
+            keyUp.post(tap: .cghidEventTap)
+            usleep(1_500)
         }
         Thread.sleep(forTimeInterval: 0.03)
+    }
+
+    /**
+     * Types text into a terminal as ordinary key presses, about 20 characters per press, instead of pasting it.
+     *
+     * Why: some terminals (cmux, for one) finish a ⌘V paste a moment later in the background, while Backspace takes effect at once. The next live update's Backspaces could then land before the earlier paste and erase the wrong words, leaving only the last few words in the field. Key presses are always handled in the order they were sent, so erasing and typing stay in step.
+     */
+    private func typeTextAsKeystrokes(_ text: String, source: CGEventSource) {
+        let longestTextPerKeyPressInUtf16Units = 20
+        var textChunksOnePerKeyPress = [String]()
+        var currentChunk = ""
+        for character in text {
+            if !currentChunk.isEmpty && (currentChunk + String(character)).utf16.count > longestTextPerKeyPressInUtf16Units {
+                textChunksOnePerKeyPress.append(currentChunk)
+                currentChunk = ""
+            }
+            currentChunk.append(character)
+        }
+        if !currentChunk.isEmpty {
+            textChunksOnePerKeyPress.append(currentChunk)
+        }
+        let keyboardType = Int64(LMGetKbdType())
+        for textChunk in textChunksOnePerKeyPress {
+            let chunkUtf16Units = Array(textChunk.utf16)
+            guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
+                continue
+            }
+            keyDown.flags = []
+            keyUp.flags = []
+            keyDown.keyboardSetUnicodeString(stringLength: chunkUtf16Units.count, unicodeString: chunkUtf16Units)
+            keyUp.keyboardSetUnicodeString(stringLength: chunkUtf16Units.count, unicodeString: chunkUtf16Units)
+            keyDown.setIntegerValueField(.keyboardEventKeyboardType, value: keyboardType)
+            keyUp.setIntegerValueField(.keyboardEventKeyboardType, value: keyboardType)
+            keyDown.post(tap: .cghidEventTap)
+            keyUp.post(tap: .cghidEventTap)
+            usleep(3_000)
+        }
+        Thread.sleep(forTimeInterval: 0.05)
     }
 
     private func pasteText(_ text: String, source: CGEventSource) {
@@ -870,13 +1119,31 @@ final class DictationHelper: NSObject {
 
     /// Asks the app where its text cursor is on screen. If the app will not say, falls back to the text field itself, but only when the field is small (a search box or a single line), because the middle of a big editor is not a useful place for the pill. Returns nil when neither is known.
     private func textCursorRectOnScreen(of element: AXUIElement) -> NSRect? {
-        if let cursorRect = screenRectOfSelectedTextRange(of: element) {
+        var windowRect: NSRect?
+        var rawWindow: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXWindowAttribute as CFString, &rawWindow) == .success, let rawWindow {
+            windowRect = screenRectOfElement(rawWindow as! AXUIElement)
+        }
+        /* Some apps (terminals especially) report positions in their own coordinates or as zero. Only a line-sized rectangle inside the field's window, or failing that on a screen, is trusted; anything else would put the pill where nobody looks. */
+        func looksLikeARealPositionOnScreen(_ rect: NSRect, tallestAllowed: CGFloat) -> Bool {
+            guard rect.height >= 4, rect.height <= tallestAllowed, rect.width <= 4_000 else {
+                return false
+            }
+            let center = NSPoint(x: rect.midX, y: rect.midY)
+            if let windowRect {
+                return windowRect.insetBy(dx: -2, dy: -2).contains(center)
+            }
+            return NSScreen.screens.contains { screen in
+                screen.visibleFrame.contains(center)
+            }
+        }
+        if let cursorRect = screenRectOfSelectedTextRange(of: element), looksLikeARealPositionOnScreen(cursorRect, tallestAllowed: 80) {
             return cursorRect
         }
-        guard let fieldRect = screenRectOfElement(element), fieldRect.height <= 120 else {
-            return nil
+        if let fieldRect = screenRectOfElement(element), looksLikeARealPositionOnScreen(fieldRect, tallestAllowed: 120) {
+            return fieldRect
         }
-        return fieldRect
+        return nil
     }
 
     private func screenRectOfSelectedTextRange(of element: AXUIElement) -> NSRect? {
@@ -1050,7 +1317,71 @@ final class DictationHelper: NSObject {
         emit(["type": "save-audio-request", "text": trimmedText])
     }
 
-    /// Tells the app which button the person clicked on the speaking pill: "next-speed", "rewind", "toggle-pause" or "stop".
+    /// Tells the app the person clicked the ✕ on the working pill; the app cancels the dictation or the MP3 being made.
+    /**
+     * After hours of running, macOS sometimes keeps the pill window off screen even though it was told to show it, so the person sees nothing while dictating. This asks the window server whether the pill is really on screen; if it is not, it builds a new pill in the same place and shows that one instead.
+     */
+    private func replacePillIfMacOSIsNotShowingIt(title: String, detail: String, tone: String, level: CGFloat) {
+        if pillShownSince == nil {
+            pillShownSince = Date()
+        }
+        guard let pillShownSince,
+              Date().timeIntervalSince(pillShownSince) > 0.8,
+              Date().timeIntervalSince(lastPillOnScreenCheckAt) > 0.5 else {
+            return
+        }
+        lastPillOnScreenCheckAt = Date()
+        if isWindowReallyOnScreen(pillPanel.windowNumber) {
+            return
+        }
+        swapInAFreshPillWindow()
+        pillPanel.update(title: title, detail: detail, tone: tone, level: level)
+        self.pillShownSince = Date()
+        appendTypingLog("pill was not on screen; replaced it with a new one")
+    }
+
+    /**
+     * Throws the pill window away and makes a new one in its place. Done at the start of every take and after sleep, a display change or a desktop switch, because macOS can quietly drop an old window's "show on every desktop" setting (seen with two displays after waking), leaving the pill invisible everywhere except one desktop.
+     */
+    private func swapInAFreshPillWindow() {
+        let textCursorRectOfTheOldPill = pillPanel.textCursorRectOnScreen
+        let wasOldPillVisible = pillPanel.isVisible
+        pillPanel.orderOut(nil)
+        pillPanel.close()
+        pillPanel = ListeningPillPanel()
+        pillPanel.textCursorRectOnScreen = textCursorRectOfTheOldPill
+        shouldRebuildPillOnNextUpdate = false
+        if !wasOldPillVisible {
+            pillShownSince = nil
+        }
+    }
+
+    /// Rebuilds the pill on its next update after the Mac wakes, the displays change, or the person switches desktop.
+    func rebuildPillAfterSleepDisplayOrDesktopChanges() {
+        let markPillForRebuild: (Notification) -> Void = { [weak self] _ in
+            self?.shouldRebuildPillOnNextUpdate = true
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main, using: markPillForRebuild)
+        for workspaceNotification in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification, NSWorkspace.activeSpaceDidChangeNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(forName: workspaceNotification, object: nil, queue: .main, using: markPillForRebuild)
+        }
+    }
+
+    /// Asks the window server (not AppKit, which can be wrong here) whether this window is among the ones currently drawn on screen.
+    private func isWindowReallyOnScreen(_ windowNumber: Int) -> Bool {
+        guard windowNumber > 0,
+              let windowDescriptions = CGWindowListCopyWindowInfo([.optionIncludingWindow], CGWindowID(windowNumber)) as? [[String: Any]],
+              let windowDescription = windowDescriptions.first else {
+            return false
+        }
+        return (windowDescription[kCGWindowIsOnscreen as String] as? Bool) == true
+    }
+
+    func askAppToCancelWhatThePillShows() {
+        emit(["type": "pill-cancel"])
+    }
+
+    /// Tells the app which button the person clicked on the speaking pill: "speed:<value>" (such as "speed:1.25"), "rewind", "toggle-pause" or "stop".
     func askAppToControlSpeech(_ action: String) {
         emit(["type": "speech-control", "action": action])
     }
@@ -1114,7 +1445,7 @@ final class ListeningPillPanel: NSPanel {
         pillView.title = title
         pillView.detail = detail
         pillView.tone = tone
-        ignoresMouseEvents = tone != "speaking"
+        ignoresMouseEvents = tone != "speaking" && tone != "working" && tone != "listening"
         pillView.rememberMicrophoneLevel(level)
         placeNearTheTextCursor(width: pillView.preferredWidth())
         pillView.startAnimating()
@@ -1173,12 +1504,22 @@ final class PillContentView: NSView {
 
     /// Clicks on the speaking pill's buttons go to the app; clicks anywhere else on the pill do nothing.
     override func mouseDown(with event: NSEvent) {
+        if tone == "working" || tone == "listening" {
+            if rectOfPillCancelButton().insetBy(dx: -8, dy: -8).contains(convert(event.locationInWindow, from: nil)) {
+                if tone == "listening" {
+                    DictationHelper.shared.cancelDictationBecauseThePillCrossWasClicked()
+                } else {
+                    DictationHelper.shared.askAppToCancelWhatThePillShows()
+                }
+            }
+            return
+        }
         guard tone == "speaking" else {
             return
         }
         switch speakingPillButton(at: convert(event.locationInWindow, from: nil)) {
         case .speed:
-            DictationHelper.shared.askAppToControlSpeech("next-speed")
+            showSpeedMenuUnderTheSpeedButton()
         case .rewind:
             DictationHelper.shared.askAppToControlSpeech("rewind")
         case .playOrPause:
@@ -1188,6 +1529,30 @@ final class PillContentView: NSView {
         case nil:
             break
         }
+    }
+
+    /// Opens a small menu of reading speeds under the pill's speed label; picking one tells the app "speed:<value>", such as "speed:1.25".
+    private func showSpeedMenuUnderTheSpeedButton() {
+        let detailParts = detail.split(separator: "|").map(String.init)
+        let currentSpeedLabel = detailParts.count > 1 ? detailParts[1] : "1x"
+        let speedMenu = NSMenu()
+        speedMenu.autoenablesItems = false
+        for speedValue in ["0.5", "0.75", "1", "1.25", "1.5", "2"] {
+            let speedItem = NSMenuItem(title: "\(speedValue)x", action: #selector(speedMenuItemWasChosen(_:)), keyEquivalent: "")
+            speedItem.target = self
+            speedItem.representedObject = speedValue
+            speedItem.state = "\(speedValue)x" == currentSpeedLabel ? .on : .off
+            speedMenu.addItem(speedItem)
+        }
+        let speedButtonRect = rectOfSpeakingPillButton(.speed)
+        speedMenu.popUp(positioning: nil, at: NSPoint(x: speedButtonRect.minX, y: speedButtonRect.minY - 4), in: self)
+    }
+
+    @objc private func speedMenuItemWasChosen(_ speedItem: NSMenuItem) {
+        guard let speedValue = speedItem.representedObject as? String else {
+            return
+        }
+        DictationHelper.shared.askAppToControlSpeech("speed:\(speedValue)")
     }
 
     private var isShowingAMessage: Bool {
@@ -1214,6 +1579,9 @@ final class PillContentView: NSView {
     func preferredWidth() -> CGFloat {
         if tone == "speaking" {
             return 320
+        }
+        if tone == "working" || tone == "listening" {
+            return 300
         }
         if !isShowingAMessage {
             return 260
@@ -1252,7 +1620,8 @@ final class PillContentView: NSView {
         case "listening":
             drawStatusDot(color: listeningColor, pulsePhase: secondsSinceStateStarted)
             drawLiveWaveform()
-            drawRightLabel(detail, monospaced: true)
+            drawRightLabel(detail, monospaced: true, rightMargin: 20 + pillCancelButtonSize + 8)
+            drawPillCancelButton()
         case "speaking":
             drawStatusDot(color: speakingColor, pulsePhase: secondsSinceStateStarted)
             drawLiveWaveform(color: speakingColor)
@@ -1260,7 +1629,8 @@ final class PillContentView: NSView {
         case "working":
             drawStatusDot(color: workingColor, pulsePhase: nil)
             drawRipple(secondsSinceStateStarted: secondsSinceStateStarted)
-            drawRightLabel(title, monospaced: false)
+            drawRightLabel(title, monospaced: false, rightMargin: 20 + pillCancelButtonSize + 8)
+            drawPillCancelButton()
         case "done":
             drawTick(color: doneColor)
             drawMessage()
@@ -1287,7 +1657,7 @@ final class PillContentView: NSView {
 
     /// The bars fill the space between the dot and the label on the right. A one-word working label needs more room than the clock.
     private func waveformArea() -> NSRect {
-        let roomForRightLabel: CGFloat = tone == "working" ? 112 : (tone == "speaking" ? 16 + speakingPillButtonWidth * CGFloat(SpeakingPillButton.allCases.count) + 10 : 72)
+        let roomForRightLabel: CGFloat = tone == "working" ? 112 + pillCancelButtonSize + 8 : (tone == "speaking" ? 16 + speakingPillButtonWidth * CGFloat(SpeakingPillButton.allCases.count) + 10 : (tone == "listening" ? 72 + pillCancelButtonSize + 8 : 72))
         return NSRect(x: 46, y: 12, width: bounds.width - 46 - roomForRightLabel, height: bounds.height - 24)
     }
 
@@ -1408,7 +1778,33 @@ final class PillContentView: NSView {
         }
     }
 
-    private func drawRightLabel(_ text: String, monospaced: Bool) {
+    private let pillCancelButtonSize: CGFloat = 26
+
+    /// The round ✕ at the right end of the listening and working pills; it cancels only the current dictation, like Escape.
+    private func rectOfPillCancelButton() -> NSRect {
+        NSRect(x: bounds.width - 16 - pillCancelButtonSize, y: bounds.midY - pillCancelButtonSize / 2, width: pillCancelButtonSize, height: pillCancelButtonSize)
+    }
+
+    /// Draws a thin ring with a ✕ inside, the same style as the window's icon buttons, so it is clear the pill can be cancelled.
+    private func drawPillCancelButton() {
+        let buttonRect = rectOfPillCancelButton()
+        let ring = NSBezierPath(ovalIn: buttonRect.insetBy(dx: 0.5, dy: 0.5))
+        ring.lineWidth = 1
+        NSColor(calibratedWhite: 1, alpha: 0.45).setStroke()
+        ring.stroke()
+        let crossHalfLength: CGFloat = 4.5
+        let cross = NSBezierPath()
+        cross.move(to: NSPoint(x: buttonRect.midX - crossHalfLength, y: buttonRect.midY - crossHalfLength))
+        cross.line(to: NSPoint(x: buttonRect.midX + crossHalfLength, y: buttonRect.midY + crossHalfLength))
+        cross.move(to: NSPoint(x: buttonRect.midX - crossHalfLength, y: buttonRect.midY + crossHalfLength))
+        cross.line(to: NSPoint(x: buttonRect.midX + crossHalfLength, y: buttonRect.midY - crossHalfLength))
+        cross.lineWidth = 1.8
+        cross.lineCapStyle = .round
+        NSColor(calibratedWhite: 1, alpha: 0.9).setStroke()
+        cross.stroke()
+    }
+
+    private func drawRightLabel(_ text: String, monospaced: Bool, rightMargin: CGFloat = 20) {
         let font = monospaced
             ? NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .medium)
             : NSFont.systemFont(ofSize: 12, weight: .medium)
@@ -1419,7 +1815,7 @@ final class PillContentView: NSView {
         let shortText = String(text.prefix(16))
         let size = (shortText as NSString).size(withAttributes: attributes)
         (shortText as NSString).draw(
-            at: NSPoint(x: bounds.width - 20 - size.width, y: bounds.midY - size.height / 2),
+            at: NSPoint(x: bounds.width - rightMargin - size.width, y: bounds.midY - size.height / 2),
             withAttributes: attributes
         )
     }
@@ -1492,8 +1888,20 @@ struct DictationHelperMain {
             let countsEmojiAsOneCharacter = sharedLeadingCharacterCount("hi 👋🏽 a", "hi 👋🏽 b") == 5
             let toleratesWrappedLines = textContainsIgnoringLineWrapping("> hello there how\n  are you", "there how are you")
             let neverPressesEnterInTerminal = textSafeForTerminal("ls\nrm -rf x\r\tdone") == "ls rm -rf x  done"
+            let continuesAfterTypedWords = transcriptPartNotYetTyped(latestTranscript: "Hello world how are you ", wordsAlreadyInField: "Hello world ") == "how are you "
+            let ignoresAddedPunctuation = transcriptPartNotYetTyped(latestTranscript: "Hello, world. How are you ", wordsAlreadyInField: "Hello world ") == "How are you "
+            let skipsWordTheModelFinished = transcriptPartNotYetTyped(latestTranscript: "Hello world how are you ", wordsAlreadyInField: "Hello wor ") == "how are you "
+            let handlesMergedWords = transcriptPartNotYetTyped(latestTranscript: "today is good and sunny ", wordsAlreadyInField: "to day is good ") == "and sunny "
+            let handlesChangedWord = transcriptPartNotYetTyped(latestTranscript: "I went to a store and left ", wordsAlreadyInField: "I went to the store ") == "and left "
+            let handlesAddedWords = transcriptPartNotYetTyped(latestTranscript: "I went to the store and left ", wordsAlreadyInField: "I went store ") == "and left "
+            let typesNothingWhenNothingIsNew = transcriptPartNotYetTyped(latestTranscript: "Hello world. ", wordsAlreadyInField: "Hello world ") == ""
+            let keepsWordsWhenTextsDiffer = transcriptPartNotYetTyped(latestTranscript: "So we went ", wordsAlreadyInField: "Okay ") == "So we went "
+            let typesEverythingWhenFieldHasNone = transcriptPartNotYetTyped(latestTranscript: "Hello ", wordsAlreadyInField: "") == "Hello "
             let pass = ownsWholeField && leavesSurroundingText && ignoresEmpty
                 && keepsUnchangedWords && countsEmojiAsOneCharacter && neverPressesEnterInTerminal && toleratesWrappedLines
+                && continuesAfterTypedWords && ignoresAddedPunctuation && skipsWordTheModelFinished && handlesMergedWords
+                && handlesChangedWord && handlesAddedWords && typesNothingWhenNothingIsNew && keepsWordsWhenTextsDiffer
+                && typesEverythingWhenFieldHasNone
             print("SELF_TEST pass=\(pass)")
             fflush(stdout)
             exit(pass ? 0 : 1)

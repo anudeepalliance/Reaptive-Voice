@@ -49,6 +49,56 @@ class WordReplacementTest {
         )
     }
 
+    private val peekopalsFixWithOnlyOneListedSpelling = WordReplacement(id = 10, misheardSpellings = listOf("Peacopals"), correctWord = "Peekopals")
+
+    @Test
+    fun fixesUnlistedSpellingsThatSoundLikeALongCorrectWord() {
+        assertEquals(
+            "Peekopals, Peekopals, Peekopals and Peekopals.",
+            applyWordReplacements("PicoPals, Pecopals, Pico pals and pico-pals.", listOf(peekopalsFixWithOnlyOneListedSpelling)),
+        )
+    }
+
+    @Test
+    fun fixesAnUnlistedSpellingThatEndsInApostropheS() {
+        assertEquals(
+            "Can you check why the Peekopals feed is not loading?",
+            applyWordReplacements("Can you check why the Pico Pal's feed is not loading?", listOf(peekopalsFixWithOnlyOneListedSpelling)),
+        )
+    }
+
+    @Test
+    fun keepsThePossessiveOfAnAlreadyCorrectWord() {
+        assertEquals(
+            "Is Peekopals's app live?",
+            applyWordReplacements("Is Peekopals's app live?", listOf(peekopalsFixWithOnlyOneListedSpelling)),
+        )
+    }
+
+    @Test
+    fun leavesOrdinaryWordsNearALongCorrectWordAlone() {
+        val sentence = "I picked up my pals, popped a pill and played some pickleball with pickles."
+        assertEquals(sentence, applyWordReplacements(sentence, listOf(peekopalsFixWithOnlyOneListedSpelling)))
+    }
+
+    @Test
+    fun onlyFixesListedSpellingsForShortCorrectWords() {
+        val meeraFix = WordReplacement(id = 11, misheardSpellings = listOf("Mira"), correctWord = "Meera")
+        val ktorFix = WordReplacement(id = 12, misheardSpellings = listOf("Kator"), correctWord = "Ktor")
+        assertEquals(
+            "Meera wants more keto food, and the Ktor server is up.",
+            applyWordReplacements("Mira wants more keto food, and the Kator server is up.", listOf(meeraFix, ktorFix)),
+        )
+    }
+
+    @Test
+    fun doesNotJoinWordsAcrossPunctuation() {
+        assertEquals(
+            "I saw Pico. Pals came later.",
+            applyWordReplacements("I saw Pico. Pals came later.", listOf(peekopalsFixWithOnlyOneListedSpelling)),
+        )
+    }
+
     @Test
     fun splitsTheHeardBoxOnCommas() {
         assertEquals(

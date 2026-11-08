@@ -116,8 +116,7 @@ tasks.matching { task ->
         jvmArgs(
             "-Dapple.awt.application.name=Rvoice",
             "-Dapple.awt.enableTemplateImages=true",
-            "-Xdock:name=Rvoice",
-            "-Xdock:icon=${project.file("icons/Rvoice.png").absolutePath}",
+            "-Dapple.awt.UIElement=true",
         )
     }
 }
@@ -153,7 +152,7 @@ compose.desktop {
         jvmArgs += listOf(
             "-Dapple.awt.application.name=Rvoice",
             "-Dapple.awt.enableTemplateImages=true",
-            "-Xdock:name=Rvoice",
+            "-Dapple.awt.UIElement=true",
         )
 
         nativeDistributions {
@@ -188,6 +187,8 @@ compose.desktop {
                         <string>Rvoice</string>
                         <key>CFBundleName</key>
                         <string>Rvoice</string>
+                        <key>LSUIElement</key>
+                        <true/>
                     """.trimIndent()
                 }
             }
@@ -226,8 +227,16 @@ tasks.matching { task ->
 
 val packagedRvoiceApp = layout.buildDirectory.dir("compose/binaries/main/app/Rvoice.app")
 
-tasks.register<Exec>("signRvoiceWithMicrophoneEntitlement") {
+/** The packaging step drops the "runnable" flag from the bundled helper, microphone and speaker programs, so it is put back before signing. */
+tasks.register<Exec>("makePackagedRvoiceToolsRunnable") {
     dependsOn("createDistributable")
+    val resourcesPath = packagedRvoiceApp.map { it.asFile.absolutePath + "/Contents/app/resources" }
+    argumentProviders.add(CommandLineArgumentProvider { listOf("-R", "a+rx", resourcesPath.get()) })
+    executable = "chmod"
+}
+
+tasks.register<Exec>("signRvoiceWithMicrophoneEntitlement") {
+    dependsOn("makePackagedRvoiceToolsRunnable")
     val entitlementsFile = project.file("entitlements.plist")
     val appPath = packagedRvoiceApp.map { it.asFile.absolutePath }
     inputs.file(entitlementsFile)

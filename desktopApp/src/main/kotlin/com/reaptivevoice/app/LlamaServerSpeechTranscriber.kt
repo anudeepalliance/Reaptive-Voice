@@ -18,8 +18,14 @@ class LlamaServerSpeechTranscriber(
     private val modelFile: File,
     private val audioProjectorFile: File,
     private val logFile: File,
-    private val port: Int = 8741,
+    private val port: Int = findFreeLocalPort(),
 ) {
+    /** Runs when the model server quits after it was ready (not when Rvoice shuts it down). Gets the end of the server's log. */
+    var onServerStoppedUnexpectedly: (lastLogLines: String) -> Unit = {}
+
+    @Volatile
+    private var isShuttingDown = false
+
     private val httpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(3))
         .build()
@@ -49,7 +55,35 @@ class LlamaServerSpeechTranscriber(
         return waitUntilHealthy(serverProcess!!)
     }
 
-    fun transcribeWavFile(wavFile: File, languageEnglishName: String): String {
+    /**
+     * Watches the ready server and reports if it quits on its own, so Rvoice does not keep recording with nothing to turn the audio into text.
+     */
+    private fun watchServerUntilItStops(process: Process) {
+        Thread(
+            {
+                process.waitFor()
+                if (!isShuttingDown && serverProcess === process) {
+                    onServerStoppedUnexpectedly(logTail())
+                }
+            },
+            "speech-server-watchdog",
+        ).apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    /** The request being answered right now, so Escape or the pill's ✕ can abandon it. */
+    @Volatile
+    private var transcriptionRequestInFlight: java.util.concurrent.CompletableFuture<HttpResponse<String>>? = null
+
+    /** Abandons the transcription that is running, if any; the waiting call then throws [TranscriptionCancelledException]. */
+    fun cancelTranscriptionInProgress() {
+        transcriptionRequestInFlight?.cancel(true)
+    }
+
+    /** Turns one recording into text. [customWordSpellings] are the person's custom words, listed in the instruction so the model spells them right. */
+    fun transcribeWavFile(wavFile: File, languageEnglishName: String, customWordSpellings: List<String>): String {
         val wavBytes = wavFile.readBytes()
         val body = JSONObject()
         body.put("model", "lfm3-audio")
@@ -60,7 +94,7 @@ class LlamaServerSpeechTranscriber(
         messages.put(
             JSONObject()
                 .put("role", "system")
-                .put("content", buildAsrSystemPrompt(languageEnglishName)),
+                .put("content", buildAsrSystemPrompt(languageEnglishName, customWordSpellings)),
         )
         val audioPart = JSONObject()
             .put("type", "input_audio")
@@ -82,7 +116,17 @@ class LlamaServerSpeechTranscriber(
             .header("Content-Type", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
             .build()
-        val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
+        val requestInFlight = httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+        transcriptionRequestInFlight = requestInFlight
+        val response = try {
+            requestInFlight.get()
+        } catch (_: java.util.concurrent.CancellationException) {
+            throw TranscriptionCancelledException()
+        } catch (exception: java.util.concurrent.ExecutionException) {
+            throw exception.cause ?: exception
+        } finally {
+            transcriptionRequestInFlight = null
+        }
         if (response.statusCode() != 200) {
             throw IllegalStateException(errorMessageFromServer(response.body()))
         }
@@ -90,6 +134,7 @@ class LlamaServerSpeechTranscriber(
     }
 
     fun shutdown() {
+        isShuttingDown = true
         serverProcess?.destroy()
         serverProcess = null
     }
@@ -127,6 +172,7 @@ class LlamaServerSpeechTranscriber(
                 return "The speech model stopped while loading. ${logTail()}"
             }
             if (isHealthy()) {
+                watchServerUntilItStops(process)
                 return null
             }
             Thread.sleep(400)
@@ -164,7 +210,19 @@ class LlamaServerSpeechTranscriber(
     }
 }
 
-private fun errorMessageFromServer(responseBody: String): String {
+/**
+ * Asks the system for a port nobody is using. Each Rvoice launch gets its own, so a model server left over from another copy of Rvoice can never answer in its place.
+ */
+internal fun findFreeLocalPort(): Int {
+    return java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress()).use { socket ->
+        socket.localPort
+    }
+}
+
+/** Thrown when a transcription was abandoned on purpose (Escape or the pill's ✕). */
+class TranscriptionCancelledException : Exception("The transcription was cancelled.")
+
+internal fun errorMessageFromServer(responseBody: String): String {
     return try {
         JSONObject(responseBody).getJSONObject("error").optString("message", responseBody.take(400))
     } catch (_: Exception) {
@@ -172,7 +230,7 @@ private fun errorMessageFromServer(responseBody: String): String {
     }
 }
 
-private fun transcriptFromChatCompletion(responseBody: String): String {
+internal fun transcriptFromChatCompletion(responseBody: String): String {
     val message = JSONObject(responseBody)
         .getJSONArray("choices")
         .getJSONObject(0)
